@@ -16,7 +16,7 @@ class MathEvaluator:
     def rule_judge(self, solution_str: str, ground_truth: str, finish_generation: bool = True) -> bool:
         raise NotImplementedError
 
-    def extract_after_think(self, text: str, truncate_length: int = 1000, finish_generation: bool = True) -> str:
+    def extract_after_think(self, text: str, truncate_length: int = 0, finish_generation: bool = True) -> str:
         pattern = r"</think>(.*)"
         match = re.search(pattern, text, re.DOTALL)
         return match.group(1).strip() if (match and finish_generation) else text[-truncate_length:]
