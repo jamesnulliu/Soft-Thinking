@@ -136,9 +136,10 @@ class Sampler(nn.Module):
                 # ==========
                 # begin of soft thinking
                 # ==========
+                # calculate the entropy
+                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+                logits_output.entropy = entropy
                 if enable_soft_thinking:
-                    # calculate the entropy
-                    entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
                     soft_mask = sampling_info.soft_thinking_modes # Shape (B,)
                     top_ps = torch.where(soft_mask, sampling_info.top_ps, sampling_info.after_thinking_top_ps)
                     top_ks = torch.where(soft_mask, sampling_info.top_ks, sampling_info.after_thinking_top_ks)
@@ -200,7 +201,6 @@ class Sampler(nn.Module):
 
                     logits_output.topk_probs = topk_probs
                     logits_output.topk_indices = topk_indices
-                    logits_output.entropy = entropy
                     batch_next_token_ids = topk_indices[:, 0].to(torch.int32)
                 # ==========
                 # end of soft thinking

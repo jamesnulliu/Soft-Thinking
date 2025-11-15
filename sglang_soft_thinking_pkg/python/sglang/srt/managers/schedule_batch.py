@@ -594,8 +594,10 @@ class Req:
             # NOTE: 输入的部分暂时不进行保留。 shape: [output_len, K]
             self.output_topk_prob_list = []
             self.output_topk_idx_list = []
+            self.output_entropies_list = []
             self.output_topk_prob_list_tmp = []
             self.output_topk_idx_list_tmp = []
+            self.output_entropies_list_tmp = []
             # track consecutive low entropy steps for early stopping
             self.low_entropy_steps = 0
         # ==========
@@ -740,7 +742,7 @@ class Req:
                 else:
                     self.low_entropy_steps = 0
                 if self.low_entropy_steps >= self.sampling_params.early_stopping_length_threshold:
-                    print(f"Early stopping triggered", flush=True)
+                    print("Early stopping triggered", flush=True)
                     # trigger early stop, emit think_end_str token
                     self.output_ids[-1] = self.sampling_params.think_end_str_id
                     self.topk_prob[1:].fill_(0)
@@ -765,7 +767,7 @@ class Req:
                 else:
                     self.low_entropy_steps = 0
                 if self.low_entropy_steps >= self.sampling_params.early_stopping_length_threshold:
-                    print(f"Early stopping triggered.", flush=True)
+                    print("Early stopping triggered.", flush=True)
                     self.to_abort = True
 
             # 普通模式下只需 in-place 清零 tail，head 保持 logits 输出
@@ -777,6 +779,7 @@ class Req:
         if not self.finished():
             self.output_topk_prob_list_tmp.append(self.topk_prob)
             self.output_topk_idx_list_tmp.append(self.topk_idx)
+            self.output_entropies_list_tmp.append(self.entropy.item())
 
     def get_output_topk_prob_list(self):
         if self.output_topk_prob_list_tmp:
@@ -789,6 +792,13 @@ class Req:
             self.output_topk_idx_list.extend(torch.stack(self.output_topk_idx_list_tmp, dim=0).cpu().tolist())
             self.output_topk_idx_list_tmp = []
         return self.output_topk_idx_list
+
+    def get_output_entropies_list(self):
+        if self.output_entropies_list_tmp:
+            self.output_entropies_list.extend(self.output_entropies_list_tmp)
+            self.output_entropies_list_tmp = []
+        return self.output_entropies_list
+    
     # ==========
     # end of soft thinking
     # ==========

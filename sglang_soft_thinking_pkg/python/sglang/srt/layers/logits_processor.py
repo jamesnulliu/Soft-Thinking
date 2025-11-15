@@ -79,6 +79,7 @@ class LogitsProcessorOutput:
     # ==========
     topk_probs: Optional[torch.Tensor] = None
     topk_indices: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
     # ==========
     # end of soft thinking
     # ==========
