@@ -94,14 +94,13 @@ class Sampler(nn.Module):
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             batch_next_token_ids = torch.argmax(logits, -1)
+            logits[:] = torch.softmax(logits, dim=-1)
+            probs = logits
+            del logits
+            entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+            logits_output.entropy = entropy
             if enable_soft_thinking:
                 # logits_output.topk_probs, logits_output.topk_indices 
-                logits.div_(sampling_info.temperatures)
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
-                del logits
-                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
-                logits_output.entropy = entropy
                 # # determine how many top-k to keep (at least 1)
                 # # 只用argmax，不用topk以提升速度
                 # max_k = max(1, sampling_info.max_topk if sampling_info.max_topk is not None else 1)
