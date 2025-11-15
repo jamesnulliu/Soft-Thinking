@@ -1,6 +1,8 @@
 import sglang as sgl
 from transformers import AutoTokenizer
 from datasets import load_dataset
+import torch
+
 
 def main():
     slg_engine_args = {
@@ -45,11 +47,9 @@ def main():
         "early_stopping_length_threshold": 256,
     }
 
-    prompt_template = (
-        "{input}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
-    )
+    prompt_template = "{input}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
-    dataset = load_dataset("HuggingFaceH4/MATH-500")["test"].select(range(1))
+    dataset = load_dataset("HuggingFaceH4/MATH-500")["test"].select()
 
     tokenizer = AutoTokenizer.from_pretrained(**tokenizer_args)
     llm = sgl.Engine(**slg_engine_args)
@@ -58,7 +58,9 @@ def main():
 
     for sample in dataset:
         problem = sample["problem"]
-        message = [{"role": "user", "content": prompt_template.replace("{input}", problem)}]
+        message = [
+            {"role": "user", "content": prompt_template.replace("{input}", problem)}
+        ]
         prompt = tokenizer.apply_chat_template(
             message,
             add_generation_prompt=True,
@@ -72,13 +74,10 @@ def main():
         sampling_params=sampling_params,
     )
 
-    decoded_text = [o["text"] for o in outputs]
-    entropies = [o["entropies"] for o in outputs]
+    entropies: list[list[float]] = [o["entropies"] for o in outputs]
 
-    print(f"Length of decoded_text: {len(decoded_text)}")
-    print(f"Decoded text: {decoded_text[0][0:100]}")
-    print(f"Length of entropies: {len(entropies)}")
-    print(f"entropies: {entropies[0][0:100]}")
+    torch.save(entropies, "math500_softthinking_entropies.pt")
+
 
 if __name__ == "__main__":
     main()
