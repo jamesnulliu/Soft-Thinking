@@ -94,12 +94,12 @@ class Sampler(nn.Module):
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             batch_next_token_ids = torch.argmax(logits, -1)
+            logits[:] = torch.softmax(logits, dim=-1)
+            probs = logits
+            del logits
+            entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+            logits_output.entropy = entropy
             if enable_soft_thinking:
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
-                del logits
-                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
-                logits_output.entropy = entropy
                 max_topk = sampling_info.max_topk
                 if logits_output.topk_probs is None:
                     logits_output.topk_probs = torch.zeros(
