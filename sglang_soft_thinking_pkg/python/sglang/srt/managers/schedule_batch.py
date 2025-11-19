@@ -576,6 +576,7 @@ class Req:
         # begin of soft thinking
         # ==========
         self.enable_soft_thinking = enable_soft_thinking
+        self.output_entropies_list_tmp = []
         if self.enable_soft_thinking:
             self.sampling_params.post_init_soft_thinking_mode()
             # 正确初始化方式
@@ -597,7 +598,6 @@ class Req:
             self.output_entropies_list = []
             self.output_topk_prob_list_tmp = []
             self.output_topk_idx_list_tmp = []
-            self.output_entropies_list_tmp = []
             # track consecutive low entropy steps for early stopping
             self.low_entropy_steps = 0
         # ==========
@@ -779,6 +779,10 @@ class Req:
         if not self.finished():
             self.output_topk_prob_list_tmp.append(self.topk_prob)
             self.output_topk_idx_list_tmp.append(self.topk_idx)
+
+    def update_entropy_info(self, logits_output, index):
+        self.entropy = logits_output.entropy[index]
+        if not self.finished():
             self.output_entropies_list_tmp.append(self.entropy.item())
 
     def get_output_topk_prob_list(self):

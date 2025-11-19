@@ -129,6 +129,7 @@ class SchedulerOutputProcessorMixin:
                     # ==========
                     if self.enable_soft_thinking:
                         req.update_topk_info(logits_output, i)   
+                    req.update_entropy_info(logits_output, i)
                     # ==========
                     # end of soft thinking
                     # ==========
@@ -279,6 +280,7 @@ class SchedulerOutputProcessorMixin:
             # ==========
             if self.enable_soft_thinking:
                 req.update_topk_info(logits_output, i)
+            req.update_entropy_info(logits_output, i)
             # ==========
             # end of soft thinking
             # ==========
