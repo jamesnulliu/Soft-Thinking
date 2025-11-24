@@ -86,6 +86,11 @@ class Sampler(nn.Module):
             if crash_on_warnings():
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
+        # We only keep track of the original probs for entropy calculation
+        probs = torch.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+        logits_output.entropy = entropy
+
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             # ==========
@@ -94,11 +99,6 @@ class Sampler(nn.Module):
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             batch_next_token_ids = torch.argmax(logits, -1)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
-            entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
-            logits_output.entropy = entropy
             if enable_soft_thinking:
                 max_topk = sampling_info.max_topk
                 if logits_output.topk_probs is None:
@@ -138,7 +138,6 @@ class Sampler(nn.Module):
                 # ==========
                 # calculate the entropy
                 entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
-                logits_output.entropy = entropy
                 if enable_soft_thinking:
                     soft_mask = sampling_info.soft_thinking_modes  # Shape (B,)
                     top_ps = torch.where(

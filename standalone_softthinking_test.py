@@ -49,7 +49,7 @@ def main():
 
     prompt_template = "{input}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
-    dataset = load_dataset("HuggingFaceH4/MATH-500")["test"].select()
+    dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
 
     tokenizer = AutoTokenizer.from_pretrained(**tokenizer_args)
     llm = sgl.Engine(**slg_engine_args)
