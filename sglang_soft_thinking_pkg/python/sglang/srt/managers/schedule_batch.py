@@ -577,6 +577,7 @@ class Req:
         # ==========
         self.enable_soft_thinking = enable_soft_thinking
         self.output_entropies_list_tmp = []
+        self.output_entropies_list = []
         if self.enable_soft_thinking:
             self.sampling_params.post_init_soft_thinking_mode()
             # 正确初始化方式
@@ -595,7 +596,6 @@ class Req:
             # NOTE: 输入的部分暂时不进行保留。 shape: [output_len, K]
             self.output_topk_prob_list = []
             self.output_topk_idx_list = []
-            self.output_entropies_list = []
             self.output_topk_prob_list_tmp = []
             self.output_topk_idx_list_tmp = []
             # track consecutive low entropy steps for early stopping
