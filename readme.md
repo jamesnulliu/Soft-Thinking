@@ -233,7 +233,7 @@ This project utilizes a modified version of the [SGLang](https://github.com/sgl-
 
 ## 📜 Citation
 
-If you use this code or dataset, please cite our paper:
+If you use this code, please cite our paper:
 
 ```bibtex
 @article{zhang2025soft,
