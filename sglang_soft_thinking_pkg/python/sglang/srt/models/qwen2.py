@@ -16,6 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, Optional, Tuple
+import os
 
 import torch
 from torch import nn
@@ -309,7 +310,8 @@ class Qwen2Model(nn.Module):
         # end of soft thinking
         # ==========
         residual = None
-        for i in range(len(self.layers)):
+        N_LAYERS_TO_REMOVE = int(os.getenv("N_LAYERS_TO_REMOVE"))
+        for i in range(len(self.layers) - N_LAYERS_TO_REMOVE):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
