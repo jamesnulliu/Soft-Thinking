@@ -309,9 +309,10 @@ class Qwen2Model(nn.Module):
         # ==========
         # end of soft thinking
         # ==========
+
         residual = None
-        N_LAYERS_TO_REMOVE = int(os.getenv("N_LAYERS_TO_REMOVE"))
-        for i in range(len(self.layers) - N_LAYERS_TO_REMOVE):
+        n_layers_to_mix = int(os.getenv("N_LAYERS_TO_MIX"))
+        for i in range(len(self.layers) - n_layers_to_mix):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -319,6 +320,23 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+        # Fuse the last n layers by averaging the hidden states and residuals
+        hidden_states_list = []
+        residual_list = []
+        for i in range(len(self.layers) - n_layers_to_mix, len(self.layers)):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+            hidden_states_list.append(hidden_states)
+            residual_list.append(residual)
+        hidden_states = torch.mean(torch.stack(hidden_states_list), dim=0)
+        if None not in residual_list:
+            residual = torch.mean(torch.stack(residual_list), dim=0)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
