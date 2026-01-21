@@ -312,6 +312,8 @@ class Qwen2Model(nn.Module):
 
         residual = None
         n_layers_to_mix = int(os.getenv("N_LAYERS_TO_MIX"))
+        layer_weights = list(map(float, os.getenv("LAYER_WEIGHTS").split(",")))
+        assert len(layer_weights) == n_layers_to_mix
         for i in range(len(self.layers) - n_layers_to_mix):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -331,8 +333,8 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
-            hidden_states_list.append(hidden_states)
-            residual_list.append(residual)
+            hidden_states_list.append(hidden_states * layer_weights[i - (len(self.layers) - n_layers_to_mix)])
+            residual_list.append(residual * layer_weights[i - (len(self.layers) - n_layers_to_mix)])
         hidden_states = torch.mean(torch.stack(hidden_states_list), dim=0)
         if None not in residual_list:
             residual = torch.mean(torch.stack(residual_list), dim=0)
