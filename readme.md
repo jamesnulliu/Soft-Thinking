@@ -26,7 +26,7 @@ Our implementation now includes support for Dirichlet and Gumbel-Softmax noise i
 Relevant parameters:
 ```bash
 --add_noise_gumbel_softmax \
---gumbel_softmax_temperature 0.5
+--gumbel_softmax_temperature 0.5 \
 --add_noise_dirichlet \
 --dirichlet_temperature 1.0 \
 ```
