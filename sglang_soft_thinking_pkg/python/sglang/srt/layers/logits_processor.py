@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: torch.Tensor
+    next_token_logits: List[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -229,34 +229,37 @@ class LogitsProcessor(nn.Module):
     def forward(
         self,
         input_ids,
-        hidden_states,
+        hidden_states: List[torch.Tensor],
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
-        # Get the last hidden states and last logits for the next token prediction
+        
+        # --- 1. PREPARE PRUNED STATES FOR ALL LAYERS ---
+        # We need to apply the pruning/slicing logic to every tensor in the hidden_states list.
+        
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
         ):
-            pruned_states = hidden_states
+            # In decode/idle, we use the full states for all layers
+            pruned_states_list = hidden_states
+            
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
+            
         elif (
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
         ):
-            # Prefill without input logprobs.
+            # Prefill without input logprobs: Calculate index once, apply to all layers.
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
                 idx = torch.arange(
                     len(logits_metadata.extend_seq_lens),
                     device=logits_metadata.extend_seq_lens.device,
@@ -266,37 +269,41 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
-            pruned_states = hidden_states[last_index]
+            
+            # Apply slicing to every layer in the list
+            pruned_states_list = [layer[last_index] for layer in hidden_states]
+            
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
+            
         else:
-            # Input logprobs are required.
-            # Find 3 different indices.
-            # 1. pruned_states: hidden states that we want logprobs from.
-            # 2. sample_indices: Indices that have sampled tokens.
-            # 3. input_logprob_indices: Indices that have input logprob tokens.
+            # Input logprobs are required (Complex Chunked Prefill).
             sample_index_pt = -1
             sample_indices = []
             input_logprob_indices_pt = 0
             input_logprob_indices = []
-            pt, pruned_states = 0, []
+            pt = 0
+            
+            # Initialize a buffer for each layer to collect chunks
+            pruned_states_buffer = [[] for _ in hidden_states]
+
             for extend_logprob_start_len, extend_len in zip(
                 logits_metadata.extend_logprob_start_lens_cpu,
                 logits_metadata.extend_seq_lens_cpu,
             ):
-                # It can happen in chunked prefill. We still need to sample 1 token,
-                # But we don't want to include it in input logprob.
                 if extend_len == extend_logprob_start_len:
                     start_len = extend_logprob_start_len - 1
                 else:
                     start_len = extend_logprob_start_len
 
-                # We always need at least 1 token to sample because that's required
-                # by a caller.
                 assert extend_len > start_len
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+                
+                # Slice and append for every layer
+                for i, layer in enumerate(hidden_states):
+                    pruned_states_buffer[i].append(layer[pt + start_len : pt + extend_len])
+                
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
                 sample_indices.append(sample_index_pt)
@@ -308,26 +315,42 @@ class LogitsProcessor(nn.Module):
                 )
                 input_logprob_indices_pt += extend_len - start_len
 
-            pruned_states = torch.cat(pruned_states)
+            # Concatenate chunks for each layer
+            pruned_states_list = [torch.cat(buf) for buf in pruned_states_buffer]
+            
             sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
+                sample_indices, device=pruned_states_list[0].device, dtype=torch.int64
             )
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
+                input_logprob_indices, device=pruned_states_list[0].device, dtype=torch.int64
             )
 
-        # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-        sampled_logits = (
-            logits[sample_indices] if sample_indices is not None else logits
-        )
+        # --- 2. COMPUTE LOGITS FOR ALL LAYERS ---
+        # Iterate over the pruned states of each layer to get a list of logits
+        logits_list = []
+        for pruned_states in pruned_states_list:
+            logits_list.append(self._get_logits(pruned_states, lm_head, logits_metadata))
+
+        # Sample from the logits for each layer
+        sampled_logits = [
+            (logits[sample_indices] if sample_indices is not None else logits)
+            for logits in logits_list
+        ]
+
+        # --- 3. LEGACY SUPPORT (FINAL LAYER ONLY) ---
+        # Isolate the final layer's data for tensor dumping, hidden state capture, 
+        # and input logprobs calculation. We assume the last element [-1] is the final layer.
+        final_layer_hidden_state = hidden_states[-1]
+        final_layer_pruned_state = pruned_states_list[-1]
+        final_layer_logits = logits_list[-1]
 
         if self.debug_tensor_dump_output_folder:
             assert (
                 not self.do_tensor_parallel_all_gather or get_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
-            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
-            dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
+            # Dump logits for the final layer only
+            full_logits_final = self._get_logits(final_layer_hidden_state, lm_head, logits_metadata)
+            dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits_final)
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -336,10 +359,9 @@ class LogitsProcessor(nn.Module):
                     aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
                     hidden_states_to_store = aux_hidden_states
                 else:
-                    hidden_states_to_store = hidden_states
+                    # Store final layer hidden state
+                    hidden_states_to_store = final_layer_hidden_state
             elif logits_metadata.capture_hidden_mode.is_last():
-                # Get the last token hidden states. If sample_indices is None,
-                # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
                     aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
                     hidden_states_to_store = (
@@ -348,23 +370,26 @@ class LogitsProcessor(nn.Module):
                         else aux_pruned_states
                     )
                 else:
+                    # Store final layer pruned state
                     hidden_states_to_store = (
-                        pruned_states[sample_indices]
+                        final_layer_pruned_state[sample_indices]
                         if sample_indices is not None
-                        else pruned_states
+                        else final_layer_pruned_state
                     )
             else:
                 assert False, "Should never reach"
 
         if not logits_metadata.extend_return_logprob:
-            # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
             )
         else:
-            input_logprobs = logits[input_logprob_indices]
-            del hidden_states, logits
+            # Use final_layer_logits for input logprobs logic
+            input_logprobs = final_layer_logits[input_logprob_indices]
+            
+            # Clean up heavy tensors to save memory
+            del hidden_states, logits_list, final_layer_logits
 
             # Normalize the logprob w/o temperature, top-p
             pruned_lens = torch.tensor(

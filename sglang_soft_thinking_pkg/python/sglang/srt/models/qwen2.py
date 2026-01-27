@@ -16,6 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, Optional, Tuple
+import os
 
 import torch
 from torch import nn
@@ -273,6 +274,9 @@ class Qwen2Model(nn.Module):
         # end of soft thinking
         # ==========
 
+        layer_weights: list[float] = list(map(float, os.getenv("LAYER_WEIGHTS").split(",")))
+        self.n_layers_to_keep = len(layer_weights)  # Keep track the last n layers
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -288,7 +292,7 @@ class Qwen2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         # ==========
         # begin of soft thinking
         # ==========
@@ -309,6 +313,7 @@ class Qwen2Model(nn.Module):
         # end of soft thinking
         # ==========
         residual = None
+        hidden_states_list = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -317,8 +322,13 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+            if i >= len(self.layers) - self.n_layers_to_keep:
+                hidden_states_list.append(
+                    self.norm(hidden_states, residual)[0]
+                )
+        
+        # hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states_list
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -405,6 +415,8 @@ class Qwen2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if not get_embedding:
+            if not isinstance(hidden_states, list):
+                hidden_states = [hidden_states]
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
             )

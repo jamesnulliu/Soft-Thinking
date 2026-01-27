@@ -1081,7 +1081,8 @@ class ModelRunner:
         else:
             # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
             sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        for i in range(len(logits_output.next_token_logits)):
+            sampling_info.apply_logits_bias(logits_output.next_token_logits[i])
 
     def sample(
         self,

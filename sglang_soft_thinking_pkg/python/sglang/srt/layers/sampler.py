@@ -35,6 +35,40 @@ class Sampler(nn.Module):
 
         if global_server_args_dict["enable_dp_attention"]:
             self.tp_sync_group = get_attention_tp_group().device_group
+        
+        import os
+        # Load config ONCE, not during the forward pass
+        self.agg_method = os.getenv("AGG_METHOD", "logit-level")
+        raw_weights = os.getenv("LAYER_WEIGHTS", "1.0")
+        self.weights_list = [float(w) for w in raw_weights.split(",")]
+        
+        # Convert to tensor for faster vector operations later
+        self.weights_tensor = torch.tensor(self.weights_list)
+
+    @torch.compile(dynamic=True)
+    def agg_probs(self, logits: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+        if not isinstance(logits, list):
+            return torch.softmax(logits, dim=-1)
+
+        # Move weights to the same device/dtype as the data
+        weights = self.weights_tensor.to(device=logits[0].device, dtype=logits[0].dtype)
+        
+        # Stack logits into a single tensor: Shape [num_layers, batch, classes]
+        stacked_logits = torch.stack(logits) 
+        # Reshape weights for broadcasting: [num_layers, 1, 1]
+        w = weights.view(-1, 1, 1)
+
+        if self.agg_method == "prob-level":
+            probs = torch.softmax(stacked_logits, dim=-1)
+            agg_probs = (probs * w).sum(dim=0)
+            return agg_probs / agg_probs.sum(dim=-1, keepdim=True)
+
+        elif self.agg_method == "logit-level":
+            agg_logits = (stacked_logits * w).sum(dim=0)
+            return torch.softmax(agg_logits, dim=-1)
+        
+        else:
+            raise ValueError(f"Invalid AGG_METHOD: {self.agg_method}")
 
     def forward(
         self,
@@ -65,24 +99,21 @@ class Sampler(nn.Module):
                 compute output logprobs It is used for speculative decoding which
                 performs sampling in draft workers.
         """
-        logits = logits_output.next_token_logits
-        # ==========
-        # begin of soft thinking
-        # ==========
-        probs_clone = None
-        # ==========
-        # end of soft thinking
-        # ==========
+
+        logits: list[torch.Tensor] = logits_output.next_token_logits
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
-            self._apply_custom_logit_processor(logits, sampling_info)
+            for logit in logits:
+                self._apply_custom_logit_processor(logit, sampling_info)
 
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
+        if self.use_nan_detection and torch.any(torch.isnan(torch.stack(logits))):
+            for i in range(len(logits)):
+                logits[i] = torch.where(
+                    torch.isnan(logits[i]),
+                    torch.full_like(logits[i], -1e5),
+                    logits[i],
+                )
             if crash_on_warnings():
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
@@ -91,9 +122,11 @@ class Sampler(nn.Module):
             # ==========
             # begin of soft thinking
             # ==========
+            probs = self.agg_probs(logits)
             if return_logprob:
-                logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-            batch_next_token_ids = torch.argmax(logits, -1)
+                # logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+            batch_next_token_ids = torch.argmax(probs, -1)
             if enable_soft_thinking:
                 # logits_output.topk_probs, logits_output.topk_indices 
                 # logits.div_(sampling_info.temperatures)
@@ -118,9 +151,10 @@ class Sampler(nn.Module):
         else:
             # Post process logits
             logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
+            # logits[:] = torch.softmax(logits, dim=-1)
+            # probs = logits
+            # del logits
+            probs = self.agg_probs(logits)
 
             if global_server_args_dict["sampling_backend"] == "flashinfer":
                 if return_logprob:
