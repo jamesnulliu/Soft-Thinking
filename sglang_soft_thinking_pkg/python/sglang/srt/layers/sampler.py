@@ -150,7 +150,8 @@ class Sampler(nn.Module):
                 pass
         else:
             # Post process logits
-            logits.div_(sampling_info.temperatures)
+            for logit in logits:
+                logit.div_(sampling_info.temperatures)
             # logits[:] = torch.softmax(logits, dim=-1)
             # probs = logits
             # del logits
