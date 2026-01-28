@@ -26,7 +26,7 @@ Our implementation now includes support for Dirichlet and Gumbel-Softmax noise i
 Relevant parameters:
 ```bash
 --add_noise_gumbel_softmax \
---gumbel_softmax_temperature 0.5
+--gumbel_softmax_temperature 0.5 \
 --add_noise_dirichlet \
 --dirichlet_temperature 1.0 \
 ```
@@ -77,12 +77,21 @@ We find it hard to reproduce some results across different devices due to precis
 
 ```bash
 # For Docker
-cd Soft-Thinking
-docker build -t soft-thinking:st-cu124-py311 .
-# NVIDIA Container Toolkit is required
-docker run --gpus all --ipc=host --rm -it \
-  -v $PWD:/workspace \
-  soft-thinking:st-cu124-py311 bash
+docker run -it --name h100_zz --gpus all \
+    --shm-size 32g \
+    --network host \
+    -v /.cache:/root/.cache \
+    -v <path_to_your_workspace>:/workspace \
+    --env "HF_TOKEN=<huggingface_token>" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    /bin/bash
+
+docker start -i h100_st
+
+cd /workspace/Soft-Thinking
+
+bash xx.sh
 ```
 
 ## 🚀 Quick Start
@@ -101,6 +110,10 @@ docker run --gpus all --ipc=host --rm -it \
    
 
 ## 🔄 Reproduction Instructions
+
+> [!WARNING]
+> 1. Soft thinking yields suboptimal results on **smaller models (≤7B or even ≤14B)**. We attribute this to limited hidden sizes, causing the last hidden state to lie in proximity to unrelated embeddings, thereby introducing substantial noise during probability weighting.
+> 2. Additionally, precision issues may arise due to insufficient VRAM, which may lead to lower performance. Please try gradually decreasing `--max_running_requests` (start from 400 to 1) to keep token usage below 90% during inference or ensure no offloading occurs and the same operator (https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/). Please refer to https://github.com/eric-ai-lab/Soft-Thinking/issues/17 if you have limited GPU memory. If you would like to contribute to deterministic Soft Thinking, please feel free to contact me!!!
 
 ### ⚖️ 1. LLM Judge
 **Use your own OpenAI key in each script.**
@@ -229,7 +242,7 @@ This project utilizes a modified version of the [SGLang](https://github.com/sgl-
 
 ## 📜 Citation
 
-If you use this code or dataset, please cite our paper:
+If you use this code, please cite our paper:
 
 ```bibtex
 @article{zhang2025soft,

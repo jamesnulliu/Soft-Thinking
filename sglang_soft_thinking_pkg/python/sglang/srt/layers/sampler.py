@@ -117,6 +117,11 @@ class Sampler(nn.Module):
             if crash_on_warnings():
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
+        # We only keep track of the original probs for entropy calculation
+        probs = torch.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+        logits_output.entropy = entropy
+
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             # ==========
@@ -128,19 +133,14 @@ class Sampler(nn.Module):
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
             batch_next_token_ids = torch.argmax(probs, -1)
             if enable_soft_thinking:
-                # logits_output.topk_probs, logits_output.topk_indices 
-                # logits.div_(sampling_info.temperatures)
-                # logits[:] = torch.softmax(logits, dim=-1)
-                # probs = logits
-                # del logits
-                # # determine how many top-k to keep (at least 1)
-                # # 只用argmax，不用topk以提升速度
-                # max_k = max(1, sampling_info.max_topk if sampling_info.max_topk is not None else 1)
-                # logits_output.topk_probs = torch.zeros(probs.shape[0], max_k, dtype=probs.dtype, device=probs.device)
-                # logits_output.topk_indices = torch.zeros(probs.shape[0], max_k, dtype=torch.long, device=probs.device)
-                
-                # # 取对应位置的概率，其余为0
-                # logits_output.topk_probs[:, 0] = torch.gather(probs, 1, batch_next_token_ids.unsqueeze(1)).squeeze(1)
+                max_topk = sampling_info.max_topk
+                if logits_output.topk_probs is None:
+                    logits_output.topk_probs = torch.zeros(
+                        probs.shape[0], max_topk, dtype=probs.dtype, device=probs.device
+                    )
+                    logits_output.topk_indices = torch.zeros(
+                        probs.shape[0], max_topk, dtype=torch.long, device=probs.device
+                    )
                 logits_output.topk_probs[:, 0] = 1
                 logits_output.topk_indices[:, 0] = batch_next_token_ids
             # ==========
@@ -171,13 +171,25 @@ class Sampler(nn.Module):
                 # ==========
                 # begin of soft thinking
                 # ==========
+                # calculate the entropy
+                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
                 if enable_soft_thinking:
-                    # calculate the entropy
-                    entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
-                    soft_mask = sampling_info.soft_thinking_modes # Shape (B,)
-                    top_ps = torch.where(soft_mask, sampling_info.top_ps, sampling_info.after_thinking_top_ps)
-                    top_ks = torch.where(soft_mask, sampling_info.top_ks, sampling_info.after_thinking_top_ks)
-                    min_ps = torch.where(soft_mask, sampling_info.min_ps, sampling_info.after_thinking_min_ps)
+                    soft_mask = sampling_info.soft_thinking_modes  # Shape (B,)
+                    top_ps = torch.where(
+                        soft_mask,
+                        sampling_info.top_ps,
+                        sampling_info.after_thinking_top_ps,
+                    )
+                    top_ks = torch.where(
+                        soft_mask,
+                        sampling_info.top_ks,
+                        sampling_info.after_thinking_top_ks,
+                    )
+                    min_ps = torch.where(
+                        soft_mask,
+                        sampling_info.min_ps,
+                        sampling_info.after_thinking_min_ps,
+                    )
                     dirichlet_alphas = sampling_info.dirichlet_alphas
 
                     # top k top p renorm
@@ -185,7 +197,10 @@ class Sampler(nn.Module):
                     probs = top_p_renorm_prob(probs, top_ps)
 
                     # minp renorm
-                    if sampling_info.need_min_p_sampling or sampling_info.need_after_thinking_min_p_sampling: # slow
+                    if (
+                        sampling_info.need_min_p_sampling
+                        or sampling_info.need_after_thinking_min_p_sampling
+                    ):  # slow
                         max_prob = probs.max(dim=-1, keepdim=True).values
                         min_p_thresholds = max_prob * min_ps.view(-1, 1)
                         min_p_mask = probs < min_p_thresholds
@@ -193,32 +208,45 @@ class Sampler(nn.Module):
                         probs = probs / probs.sum(dim=-1, keepdim=True)
 
                     # dirichlet noise (not used in paper)
-                    if add_noise_dirichlet: # slow
-                        conc = probs[soft_mask] * dirichlet_alphas[soft_mask].view(-1, 1)
-                        gamma_dist = torch.distributions.Gamma(conc, torch.ones_like(conc))
+                    if add_noise_dirichlet:  # slow
+                        conc = probs[soft_mask] * dirichlet_alphas[soft_mask].view(
+                            -1, 1
+                        )
+                        gamma_dist = torch.distributions.Gamma(
+                            conc, torch.ones_like(conc)
+                        )
                         gamma_samples = gamma_dist.sample()
-                        probs_new = gamma_samples / gamma_samples.sum(dim=-1, keepdim=True)
+                        probs_new = gamma_samples / gamma_samples.sum(
+                            dim=-1, keepdim=True
+                        )
                         probs[soft_mask] = probs_new
 
                     # max top k
-                    topk_probs, topk_indices = torch.topk(probs, k=sampling_info.max_topk, dim=-1) # slow
+                    topk_probs, topk_indices = torch.topk(
+                        probs, k=sampling_info.max_topk, dim=-1
+                    )  # slow
                     topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True))
 
                     # gumbel softmax noise (not used in paper)
-                    if add_noise_gumbel_softmax: # slow
+                    if add_noise_gumbel_softmax:  # slow
                         topk_logits = torch.log(topk_probs)
                         gumbels = (
-                            -torch.empty_like(topk_logits)
-                            .exponential_()
-                            .log()
+                            -torch.empty_like(topk_logits).exponential_().log()
                         )  # ~Gumbel(0,1)
-                        gumbels = (topk_logits + gumbels) / sampling_info.gumbel_softmax_temperatures  # ~Gumbel(logits,tau)
+                        gumbels = (
+                            (topk_logits + gumbels)
+                            / sampling_info.gumbel_softmax_temperatures
+                        )  # ~Gumbel(logits,tau)
                         topk_probs = gumbels.softmax(-1)
                         # topk_probs = F.gumbel_softmax(topk_logits, tau=sampling_info.dirichlet_alphas) # use dirichlet alpha as temperature
                         # sort the topk token according to new probability
-                        sorted_weights, sorted_idx = torch.sort(topk_probs, dim=-1, descending=True)
+                        sorted_weights, sorted_idx = torch.sort(
+                            topk_probs, dim=-1, descending=True
+                        )
                         topk_probs = sorted_weights
-                        topk_indices = torch.gather(topk_indices, dim=1, index=sorted_idx)
+                        topk_indices = torch.gather(
+                            topk_indices, dim=1, index=sorted_idx
+                        )
 
                     # after thinking sampling
                     non_soft_mask = ~soft_mask
@@ -231,15 +259,16 @@ class Sampler(nn.Module):
 
                         # Assign the first element of each row to sampled_token_ids and set it to 1.0 in topk_probs
                         topk_probs[non_soft_mask, 0] = 1.0
-                        topk_indices[non_soft_mask, 0] = sampled_token_ids[non_soft_mask].view(-1)
+                        topk_indices[non_soft_mask, 0] = sampled_token_ids[
+                            non_soft_mask
+                        ].view(-1)
 
                     logits_output.topk_probs = topk_probs
                     logits_output.topk_indices = topk_indices
-                    logits_output.entropy = entropy
                     batch_next_token_ids = topk_indices[:, 0].to(torch.int32)
                 # ==========
                 # end of soft thinking
-                # ========== 
+                # ==========
                 else:
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -274,7 +303,7 @@ class Sampler(nn.Module):
                     logprobs = torch.log(
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
                     ).clamp(min=torch.finfo(probs.dtype).min)
-                
+
             else:
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"

@@ -129,6 +129,7 @@ class SchedulerOutputProcessorMixin:
                     # ==========
                     if self.enable_soft_thinking:
                         req.update_topk_info(logits_output, i)   
+                    req.update_entropy_info(logits_output, i)
                     # ==========
                     # end of soft thinking
                     # ==========
@@ -279,6 +280,7 @@ class SchedulerOutputProcessorMixin:
             # ==========
             if self.enable_soft_thinking:
                 req.update_topk_info(logits_output, i)
+            req.update_entropy_info(logits_output, i)
             # ==========
             # end of soft thinking
             # ==========
@@ -528,6 +530,7 @@ class SchedulerOutputProcessorMixin:
         # Always initialize soft thinking output lists so they exist regardless of flag
         output_topk_probs_list = []
         output_topk_indices_list = []
+        output_entropies_list = []
         # ==========
         # end of soft thinking
         # ==========
@@ -607,6 +610,7 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_soft_thinking:
                     output_topk_probs_list.append(req.get_output_topk_prob_list())
                     output_topk_indices_list.append(req.get_output_topk_idx_list())
+                output_entropies_list.append(req.get_output_entropies_list())
                 # ==========
                 # end of soft thinking
                 # ==========
@@ -650,6 +654,7 @@ class SchedulerOutputProcessorMixin:
                     # ==========
                     output_topk_probs_list,
                     output_topk_indices_list,
+                    output_entropies_list,
                     # ==========
                     # end of soft thinking
                     # ==========

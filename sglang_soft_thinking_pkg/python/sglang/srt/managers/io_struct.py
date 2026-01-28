@@ -607,6 +607,8 @@ class BatchTokenIDOut:
     # Soft thinking
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
+    # ↓ (n_request, output_len)
+    output_entropies_list: List[List[float]]
     # ==========
     # end of soft thinking
     # ==========
@@ -663,6 +665,8 @@ class BatchStrOut:
     # ==========
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
+    # ↓ (n_request, output_len)
+    output_entropies_list: List[List[float]]
     # ==========
     # end of soft thinking
     # ==========

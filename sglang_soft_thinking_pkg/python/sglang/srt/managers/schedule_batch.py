@@ -576,6 +576,8 @@ class Req:
         # begin of soft thinking
         # ==========
         self.enable_soft_thinking = enable_soft_thinking
+        self.output_entropies_list_tmp = []
+        self.output_entropies_list = []
         if self.enable_soft_thinking:
             self.sampling_params.post_init_soft_thinking_mode()
             # 正确初始化方式
@@ -740,7 +742,7 @@ class Req:
                 else:
                     self.low_entropy_steps = 0
                 if self.low_entropy_steps >= self.sampling_params.early_stopping_length_threshold:
-                    print(f"Early stopping triggered", flush=True)
+                    print("Early stopping triggered", flush=True)
                     # trigger early stop, emit think_end_str token
                     self.output_ids[-1] = self.sampling_params.think_end_str_id
                     self.topk_prob[1:].fill_(0)
@@ -751,7 +753,7 @@ class Req:
 
             if self.sampling_params.think_end_str_id == self.output_ids[-1]:
                 # 退出 soft thinking 模式并将 topk 设置为 one-hot
-                self.sampling_params.soft_thinking_mode = False
+                self.sampling_params.soft_thinking_mode = torch.tensor(False, dtype=torch.bool, device='cuda')  # 'cuda' aligns with previous setting
                 # 一键清零再设置 head
                 self.topk_prob[1:].fill_(0)
                 self.topk_idx[1:].fill_(0)
@@ -765,7 +767,7 @@ class Req:
                 else:
                     self.low_entropy_steps = 0
                 if self.low_entropy_steps >= self.sampling_params.early_stopping_length_threshold:
-                    print(f"Early stopping triggered.", flush=True)
+                    print("Early stopping triggered.", flush=True)
                     self.to_abort = True
 
             # 普通模式下只需 in-place 清零 tail，head 保持 logits 输出
@@ -778,6 +780,11 @@ class Req:
             self.output_topk_prob_list_tmp.append(self.topk_prob)
             self.output_topk_idx_list_tmp.append(self.topk_idx)
 
+    def update_entropy_info(self, logits_output, index):
+        self.entropy = logits_output.entropy[index]
+        if not self.finished():
+            self.output_entropies_list_tmp.append(self.entropy.item())
+
     def get_output_topk_prob_list(self):
         if self.output_topk_prob_list_tmp:
             self.output_topk_prob_list.extend(torch.stack(self.output_topk_prob_list_tmp, dim=0).cpu().tolist())
@@ -789,6 +796,13 @@ class Req:
             self.output_topk_idx_list.extend(torch.stack(self.output_topk_idx_list_tmp, dim=0).cpu().tolist())
             self.output_topk_idx_list_tmp = []
         return self.output_topk_idx_list
+
+    def get_output_entropies_list(self):
+        if self.output_entropies_list_tmp:
+            self.output_entropies_list.extend(self.output_entropies_list_tmp)
+            self.output_entropies_list_tmp = []
+        return self.output_entropies_list
+    
     # ==========
     # end of soft thinking
     # ==========

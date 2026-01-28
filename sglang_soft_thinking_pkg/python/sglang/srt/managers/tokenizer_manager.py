@@ -1080,6 +1080,7 @@ class TokenizerManager:
             if isinstance(recv_obj, BatchStrOut):
                 out_dict = {
                     "text": recv_obj.output_strs[i],
+                    "entropies": recv_obj.output_entropies_list[i],
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOut):
@@ -1087,12 +1088,17 @@ class TokenizerManager:
                     output_token_ids = recv_obj.output_ids[i][
                         state.last_output_offset :
                     ]
+                    output_entropies = recv_obj.output_entropies_list[i][
+                        state.last_output_offset :
+                    ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
+                    output_entropies = recv_obj.output_entropies_list[i]
 
                 out_dict = {
                     "output_ids": output_token_ids,
+                    "entropies": output_entropies,
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchMultimodalOut):
