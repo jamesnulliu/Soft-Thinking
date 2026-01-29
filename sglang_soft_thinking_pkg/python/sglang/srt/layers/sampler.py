@@ -118,9 +118,10 @@ class Sampler(nn.Module):
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
         # We only keep track of the original probs for entropy calculation
-        probs = torch.softmax(logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+        _probs = self.agg_probs(logits)
+        entropy = -torch.sum(_probs * torch.log(_probs.clamp(min=1e-12)), dim=-1)
         logits_output.entropy = entropy
+        del _probs
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
