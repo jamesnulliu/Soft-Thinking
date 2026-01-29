@@ -52,6 +52,7 @@ class Sampler(nn.Module):
 
         # Move weights to the same device/dtype as the data
         weights = self.weights_tensor.to(device=logits[0].device, dtype=logits[0].dtype)
+        assert sum(weights).item() == 1.0, "Layer weights must sum to 1.0"
         
         # Stack logits into a single tensor: Shape [num_layers, batch, classes]
         stacked_logits = torch.stack(logits) 
@@ -60,8 +61,7 @@ class Sampler(nn.Module):
 
         if self.agg_method == "prob-level":
             probs = torch.softmax(stacked_logits, dim=-1)
-            agg_probs = (probs * w).sum(dim=0)
-            return agg_probs / agg_probs.sum(dim=-1, keepdim=True)
+            return (probs * w).sum(dim=0)
 
         elif self.agg_method == "logit-level":
             agg_logits = (stacked_logits * w).sum(dim=0)
