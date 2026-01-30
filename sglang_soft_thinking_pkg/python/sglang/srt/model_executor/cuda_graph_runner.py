@@ -613,11 +613,13 @@ class CudaGraphRunner:
         self.graphs[self.bs].replay()
         next_token_logits, hidden_states = self.output_buffers[self.bs]
 
-        for i in range(len(next_token_logits)):
-            next_token_logits[i] = next_token_logits[i][: self.raw_num_token]
+        if isinstance(next_token_logits, list):
+            sliced_logits = [t[: self.raw_num_token] for t in next_token_logits]
+        else:
+            sliced_logits = next_token_logits[: self.raw_num_token]
 
         logits_output = LogitsProcessorOutput(
-            next_token_logits=next_token_logits,
+            next_token_logits=sliced_logits,
             hidden_states=(
                 hidden_states[: self.raw_num_token]
                 if hidden_states is not None
