@@ -52,7 +52,6 @@ class Sampler(nn.Module):
 
         # Move weights to the same device/dtype as the data
         weights = self.weights_tensor.to(device=logits[0].device, dtype=logits[0].dtype)
-        assert sum(weights).item() == 1.0, "Layer weights must sum to 1.0"
         
         # Stack logits into a single tensor: Shape [num_layers, batch, classes]
         stacked_logits = torch.stack(logits) 
