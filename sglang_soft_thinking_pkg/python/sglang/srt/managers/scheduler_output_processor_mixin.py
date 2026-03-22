@@ -22,6 +22,22 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _release_req_without_radix_cache(self: Scheduler, req: Req):
+        """Release request KV allocations without inserting into radix cache."""
+        if req.req_pool_idx is None:
+            return
+
+        # Match radix_cache.cache_finished_req(disable=True) accounting.
+        kv_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        if kv_len > 0:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+
+        self.req_to_token_pool.free(req.req_pool_idx)
+        req.req_pool_idx = None
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -84,10 +100,14 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        if req.skip_prefix_cache_for_replay:
+                            self._release_req_without_radix_cache(req)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not req.skip_prefix_cache_for_replay:
+                            self.tree_cache.cache_unfinished_req(req)
 
                     if req.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -181,9 +201,13 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        if req.skip_prefix_cache_for_replay:
+                            self._release_req_without_radix_cache(req)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                     else:
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not req.skip_prefix_cache_for_replay:
+                            self.tree_cache.cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -244,7 +268,10 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
 
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                if req.skip_prefix_cache_for_replay:
+                    self._release_req_without_radix_cache(req)
+                else:
+                    self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -496,6 +523,8 @@ class SchedulerOutputProcessorMixin:
         no_stop_trim = []
         prompt_tokens = []
         completion_tokens = []
+        think_lens = []
+        full_lens = []
         cached_tokens = []
         spec_verify_ct = []
         output_hidden_states = None
@@ -573,6 +602,9 @@ class SchedulerOutputProcessorMixin:
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
+                think_len, full_len = req.get_think_and_full_len()
+                think_lens.append(think_len)
+                full_lens.append(full_len)
                 cached_tokens.append(req.cached_tokens)
 
                 if not self.spec_algorithm.is_none():
@@ -634,6 +666,8 @@ class SchedulerOutputProcessorMixin:
                     no_stop_trim,
                     prompt_tokens,
                     completion_tokens,
+                    think_lens,
+                    full_lens,
                     cached_tokens,
                     spec_verify_ct,
                     input_token_logprobs_val,

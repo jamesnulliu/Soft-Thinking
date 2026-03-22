@@ -365,6 +365,7 @@ class TokenizerManager:
         # begin of soft thinking
         # ==========
         self.enable_soft_thinking = server_args.enable_soft_thinking
+        self.max_topk = server_args.max_topk
         # ==========
         # end of soft thinking
         # ==========
@@ -447,12 +448,103 @@ class TokenizerManager:
             obj, input_text, input_ids, input_embeds, image_inputs
         )
 
+    def _validate_soft_thinking_trace(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> int:
+        if not isinstance(obj, GenerateReqInput):
+            return 0
+
+        trace = getattr(obj, "soft_thinking_trace", None)
+        if trace is None:
+            return 0
+
+        if not self.enable_soft_thinking:
+            raise ValueError(
+                "soft_thinking_trace is provided but --enable-soft-thinking is disabled."
+            )
+
+        if obj.input_embeds is not None:
+            raise ValueError(
+                "soft_thinking_trace cannot be used together with input_embeds."
+            )
+
+        if not isinstance(trace, dict):
+            raise ValueError("soft_thinking_trace should be a dict.")
+
+        topk_indices = trace.get("topk_indices")
+        topk_probs = trace.get("topk_probs")
+        if not isinstance(topk_indices, list) or not isinstance(topk_probs, list):
+            raise ValueError(
+                "soft_thinking_trace must contain list fields topk_indices and topk_probs."
+            )
+        if len(topk_indices) != len(topk_probs):
+            raise ValueError(
+                "soft_thinking_trace topk_indices and topk_probs must have the same length."
+            )
+
+        trace_len = len(topk_indices)
+        trace_k = None
+        for t, (idx_row, prob_row) in enumerate(zip(topk_indices, topk_probs)):
+            if not isinstance(idx_row, list) or not isinstance(prob_row, list):
+                raise ValueError(
+                    f"soft_thinking_trace row {t} must be a pair of lists."
+                )
+            if len(idx_row) == 0:
+                raise ValueError(
+                    f"soft_thinking_trace row {t} must contain at least one token."
+                )
+            if len(idx_row) != len(prob_row):
+                raise ValueError(
+                    f"soft_thinking_trace row {t} has mismatched topk_indices/topk_probs lengths."
+                )
+            if trace_k is None:
+                trace_k = len(idx_row)
+            elif len(idx_row) != trace_k:
+                raise ValueError(
+                    f"soft_thinking_trace row {t} top-k ({len(idx_row)}) does not match the first row top-k ({trace_k})."
+                )
+            if len(idx_row) > self.max_topk:
+                raise ValueError(
+                    f"soft_thinking_trace row {t} top-k ({len(idx_row)}) exceeds max_topk ({self.max_topk})."
+                )
+
+            prob_sum = 0.0
+            for j, token_id in enumerate(idx_row):
+                if not isinstance(token_id, int):
+                    raise ValueError(
+                        f"soft_thinking_trace row {t} token id at position {j} is not an integer."
+                    )
+                if token_id < 0 or token_id >= self.model_config.vocab_size:
+                    raise ValueError(
+                        f"soft_thinking_trace row {t} token id {token_id} is out of vocab range [0, {self.model_config.vocab_size})."
+                    )
+
+                prob = prob_row[j]
+                if not isinstance(prob, (float, int)):
+                    raise ValueError(
+                        f"soft_thinking_trace row {t} probability at position {j} is not a number."
+                    )
+                prob = float(prob)
+                if not (prob >= 0.0 and prob < float("inf")):
+                    raise ValueError(
+                        f"soft_thinking_trace row {t} probability at position {j} must be finite and non-negative."
+                    )
+                prob_sum += prob
+
+            if not (prob_sum > 0.0 and abs(prob_sum - 1.0) <= 1e-3):
+                raise ValueError(
+                    f"soft_thinking_trace row {t} probabilities must sum to 1 (got {prob_sum:.6f})."
+                )
+
+        return trace_len
+
     def _validate_token_len(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
-        input_token_num = len(input_ids) if input_ids is not None else 0
+        replay_token_num = self._validate_soft_thinking_trace(obj)
+        input_token_num = (len(input_ids) if input_ids is not None else 0) + replay_token_num
         # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
             raise ValueError(
@@ -520,6 +612,7 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
+                soft_thinking_trace=getattr(obj, "soft_thinking_trace", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -932,6 +1025,7 @@ class TokenizerManager:
                         "text",
                         "input_ids",
                         "input_embeds",
+                        "soft_thinking_trace",
                         "image_data",
                         "audio_data",
                         "lora_path",
@@ -1047,6 +1141,11 @@ class TokenizerManager:
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+
+            if hasattr(recv_obj, "think_lens"):
+                meta_info["think_len"] = recv_obj.think_lens[i]
+            if hasattr(recv_obj, "full_lens"):
+                meta_info["full_len"] = recv_obj.full_lens[i]
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from enum import Enum, auto
 
 # Copyright 2023-2024 SGLang Team
@@ -86,6 +87,9 @@ global_server_args_dict = {
 }
 
 logger = logging.getLogger(__name__)
+
+ReplayCacheKey = Tuple[str, Tuple[int, ...], Tuple[int, ...]]
+PrefixCacheKey = Union[int, ReplayCacheKey]
 
 
 class BaseFinishReason:
@@ -412,6 +416,9 @@ class Req:
         # ==========
         enable_soft_thinking: bool = False,
         max_topk: Optional[int] = None,
+        enable_think_prefix_cache: bool = True,
+        soft_thinking_trace: Optional[dict] = None,
+        soft_thinking_replay_prompt_len: Optional[int] = None,
         # ==========
         # end of soft thinking
         # ==========
@@ -431,6 +438,37 @@ class Req:
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # Optional replay state for soft-thinking prefix.
+        self.soft_thinking_trace = copy.deepcopy(soft_thinking_trace)
+        self.enable_think_prefix_cache = enable_think_prefix_cache
+        self.skip_prefix_cache_for_replay = False
+        self.soft_thinking_replay_prompt_len = soft_thinking_replay_prompt_len
+        self.soft_thinking_replay_len = 0
+        self.soft_thinking_replay_consumed = True
+        self.soft_thinking_replay_topk_probs: Optional[torch.Tensor] = None
+        self.soft_thinking_replay_topk_indices: Optional[torch.Tensor] = None
+        self.soft_thinking_replay_cache_keys: List[ReplayCacheKey] = []
+        if self.soft_thinking_trace is not None:
+            topk_indices = self.soft_thinking_trace.get("topk_indices", [])
+            topk_probs = self.soft_thinking_trace.get("topk_probs", [])
+            self.soft_thinking_replay_topk_indices = torch.tensor(
+                topk_indices, dtype=torch.int64
+            )
+            self.soft_thinking_replay_topk_probs = torch.tensor(
+                topk_probs, dtype=torch.float32
+            )
+            self.soft_thinking_replay_len = self.soft_thinking_replay_topk_indices.shape[0]
+            self.soft_thinking_replay_consumed = self.soft_thinking_replay_len == 0
+            self.skip_prefix_cache_for_replay = (
+                self.soft_thinking_replay_len > 0
+                and not self.enable_think_prefix_cache
+            )
+            if self.soft_thinking_replay_prompt_len is None:
+                self.soft_thinking_replay_prompt_len = (
+                    len(origin_input_ids) - self.soft_thinking_replay_len
+                )
+            self.soft_thinking_replay_cache_keys = self._build_replay_cache_keys()
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -600,6 +638,12 @@ class Req:
             self.output_topk_idx_list_tmp = []
             # track consecutive low entropy steps for early stopping
             self.low_entropy_steps = 0
+
+            # Replay requests should directly run normal decoding after replay prefill.
+            if self.soft_thinking_replay_len > 0:
+                self.sampling_params.soft_thinking_mode = torch.tensor(
+                    False, dtype=torch.bool, device="cuda"
+                )
         # ==========
         # end of soft thinking
         # ==========
@@ -624,7 +668,7 @@ class Req:
         enable_hierarchical_cache=False,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
-        if tree_cache is not None:
+        if tree_cache is not None and not self.skip_prefix_cache_for_replay:
             # tree cache is None if the prefix is not computed with tree cache.
             if enable_hierarchical_cache:
                 self.prefix_indices, self.last_node, self.last_node_global = (
@@ -636,6 +680,11 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif tree_cache is not None:
+            self.prefix_indices = []
+            self.last_node = tree_cache.root_node
+            if enable_hierarchical_cache:
+                self.last_node_global = tree_cache.root_node
         elif enable_hierarchical_cache:
             # in case last_node is evicted during scheduling, we need to update the prefix_indices
             while self.last_node.evicted:
@@ -662,7 +711,59 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
-        return self.fill_ids[:max_prefix_len]
+        return self.get_prefix_cache_keys(self.fill_ids[:max_prefix_len])
+
+    @staticmethod
+    def _float32_to_bfloat16_bits(value: float) -> int:
+        bits = struct.unpack(">I", struct.pack(">f", value))[0]
+        return (bits >> 16) & 0xFFFF
+
+    def _build_replay_cache_keys(self) -> List[ReplayCacheKey]:
+        if self.soft_thinking_replay_len == 0:
+            return []
+
+        replay_probs_bf16_f32 = (
+            self.soft_thinking_replay_topk_probs.to(torch.bfloat16)
+            .to(torch.float32)
+            .cpu()
+            .tolist()
+        )
+        replay_indices = self.soft_thinking_replay_topk_indices.cpu().tolist()
+
+        cache_keys: List[ReplayCacheKey] = []
+        for idx_row, prob_row in zip(replay_indices, replay_probs_bf16_f32):
+            idx_tuple = tuple(int(x) for x in idx_row)
+            prob_bits_tuple = tuple(
+                self._float32_to_bfloat16_bits(float(p)) for p in prob_row
+            )
+            cache_keys.append(("soft_thinking_replay", idx_tuple, prob_bits_tuple))
+        return cache_keys
+
+    def get_prefix_cache_keys(
+        self, token_ids: List[int], start_pos: int = 0
+    ) -> List[PrefixCacheKey]:
+        if (
+            self.soft_thinking_replay_len == 0
+            or len(token_ids) == 0
+            or not self.enable_think_prefix_cache
+        ):
+            return list(token_ids)
+
+        keys: List[PrefixCacheKey] = list(token_ids)
+        replay_start = self.soft_thinking_replay_prompt_len
+        replay_end = replay_start + self.soft_thinking_replay_len
+        end_pos = start_pos + len(token_ids)
+
+        overlap_start = max(start_pos, replay_start)
+        overlap_end = min(end_pos, replay_end)
+        if overlap_start < overlap_end:
+            src_start = overlap_start - replay_start
+            dst_start = overlap_start - start_pos
+            span_len = overlap_end - overlap_start
+            keys[dst_start : dst_start + span_len] = self.soft_thinking_replay_cache_keys[
+                src_start : src_start + span_len
+            ]
+        return keys
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -802,6 +903,71 @@ class Req:
             self.output_entropies_list.extend(self.output_entropies_list_tmp)
             self.output_entropies_list_tmp = []
         return self.output_entropies_list
+
+    def get_think_and_full_len(self) -> Tuple[int, int]:
+        full_len = len(self.output_ids)
+        think_len = full_len
+
+        think_end_id = self.sampling_params.think_end_str_id
+        if think_end_id is None and self.tokenizer is not None:
+            think_end_str = getattr(self.sampling_params, "think_end_str", None)
+            if think_end_str:
+                think_end_ids = self.tokenizer.encode(
+                    think_end_str, add_special_tokens=False
+                )
+                if think_end_ids:
+                    think_end_id = think_end_ids[-1]
+                    self.sampling_params.think_end_str_id = think_end_id
+
+        if think_end_id is not None:
+            for idx in range(full_len - 1, -1, -1):
+                if self.output_ids[idx] == think_end_id:
+                    think_len = idx
+                    break
+
+        return think_len, full_len
+
+    def build_extend_topk_tensors(
+        self, start_pos: int, end_pos: int, max_topk: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build top-k distributions for extend tokens.
+
+        For normal prompt tokens we emit one-hot (token_id, 1.0). For replayed
+        soft-thinking tokens we inject the saved distribution rows.
+        """
+        token_ids = self.fill_ids[start_pos:end_pos]
+        span = end_pos - start_pos
+
+        probs = torch.zeros((span, max_topk), dtype=torch.bfloat16)
+        indices = torch.zeros((span, max_topk), dtype=torch.int64)
+
+        if span > 0:
+            probs[:, 0] = 1.0
+            indices[:, 0] = torch.tensor(token_ids, dtype=torch.int64)
+
+        if self.soft_thinking_replay_len > 0:
+            replay_start = self.soft_thinking_replay_prompt_len
+            replay_end = replay_start + self.soft_thinking_replay_len
+            overlap_start = max(start_pos, replay_start)
+            overlap_end = min(end_pos, replay_end)
+
+            if overlap_start < overlap_end:
+                src_start = overlap_start - replay_start
+                dst_start = overlap_start - start_pos
+                span_len = overlap_end - overlap_start
+                replay_probs = self.soft_thinking_replay_topk_probs[
+                    src_start : src_start + span_len
+                ]
+                replay_indices = self.soft_thinking_replay_topk_indices[
+                    src_start : src_start + span_len
+                ]
+                replay_k = replay_indices.shape[1]
+                probs[dst_start : dst_start + span_len, :replay_k] = replay_probs.to(
+                    torch.bfloat16
+                )
+                indices[dst_start : dst_start + span_len, :replay_k] = replay_indices
+
+        return probs, indices
     
     # ==========
     # end of soft thinking
@@ -1188,6 +1354,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Copy prefix and do some basic check
         input_embeds = []
         extend_input_logprob_token_ids = []
+        extend_topk_probs = []
+        extend_topk_indices = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1203,9 +1371,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
+            if self.model_config.enable_soft_thinking and req.extend_input_len > 0 and req.input_embeds is None:
+                req_topk_probs, req_topk_indices = req.build_extend_topk_tensors(
+                    pre_len, seq_len, self.max_topk
+                )
+                extend_topk_probs.append(req_topk_probs)
+                extend_topk_indices.append(req_topk_indices)
+
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
+
+            if req.soft_thinking_replay_len > 0:
+                replay_end = req.soft_thinking_replay_prompt_len + req.soft_thinking_replay_len
+                req.soft_thinking_replay_consumed = seq_len >= replay_end
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -1283,6 +1462,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
+            else None
+        )
+        self.topk_probs = (
+            torch.cat(extend_topk_probs, dim=0).to(self.device, non_blocking=True)
+            if extend_topk_probs
+            else None
+        )
+        self.topk_indices = (
+            torch.cat(extend_topk_indices, dim=0).to(self.device, non_blocking=True)
+            if extend_topk_indices
             else None
         )
         self.seq_lens_sum = sum(seq_lens)
@@ -1676,7 +1865,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         topk_probs = None
         topk_indices = None
         if self.model_config.enable_soft_thinking:
-            if self.enable_overlap or self.forward_mode.is_decode():
+            if self.forward_mode.is_extend():
+                topk_probs = self.topk_probs
+                topk_indices = self.topk_indices
+            elif self.enable_overlap or self.forward_mode.is_decode():
                 topk_probs = torch.stack([req.topk_prob for req in self.reqs])
                 topk_indices = torch.stack([req.topk_idx for req in self.reqs])
 

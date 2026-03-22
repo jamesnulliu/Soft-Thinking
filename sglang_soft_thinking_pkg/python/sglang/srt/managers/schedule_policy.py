@@ -161,6 +161,13 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
 
+            if getattr(r, "skip_prefix_cache_for_replay", False):
+                r.prefix_indices = []
+                r.last_node = self.tree_cache.root_node
+                if self.enable_hierarchical_cache:
+                    r.last_node_global = self.tree_cache.root_node
+                continue
+
             # NOTE: the prefix_indices must always be aligned with last_node
             if self.enable_hierarchical_cache:
                 r.prefix_indices, r.last_node, r.last_node_global = (

@@ -65,7 +65,14 @@ class Session:
         self.capacity_of_str_len = capacity_of_str_len
         self.req_nodes: Dict[str, SessionReqNode] = {}
 
-    def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
+    def create_req(
+        self,
+        req: TokenizedGenerateReqInput,
+        tokenizer,
+        enable_soft_thinking: bool = False,
+        max_topk: Optional[int] = None,
+        enable_think_prefix_cache: bool = True,
+    ):
         assert req.session_params is not None
         session_params = req.session_params
 
@@ -123,6 +130,14 @@ class Session:
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
+
+        replay_trace = req.soft_thinking_trace
+        replay_prompt_len = len(input_ids)
+        if replay_trace is not None:
+            replay_token_ids = [int(row[0]) for row in replay_trace["topk_indices"]]
+            input_ids = input_ids + replay_token_ids
+            input_ids_unpadded = input_ids_unpadded + replay_token_ids
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
@@ -136,6 +151,11 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            enable_soft_thinking=enable_soft_thinking,
+            max_topk=max_topk,
+            enable_think_prefix_cache=enable_think_prefix_cache,
+            soft_thinking_trace=replay_trace,
+            soft_thinking_replay_prompt_len=replay_prompt_len,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.mm_inputs

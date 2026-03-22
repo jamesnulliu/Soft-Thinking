@@ -274,7 +274,10 @@ class Qwen2Model(nn.Module):
         # end of soft thinking
         # ==========
 
-        layer_weights: list[float] = list(map(float, os.getenv("LAYER_WEIGHTS").split(",")))
+        raw_layer_weights = os.getenv("LAYER_WEIGHTS", "1.0")
+        layer_weights = [float(w.strip()) for w in raw_layer_weights.split(",") if w.strip()]
+        if not layer_weights:
+            layer_weights = [1.0]
         self.n_layers_to_keep = len(layer_weights)  # Keep track the last n layers
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:

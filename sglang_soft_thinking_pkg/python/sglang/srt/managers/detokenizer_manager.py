@@ -214,6 +214,8 @@ class DetokenizerManager:
             output_ids=None,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
+            think_lens=recv_obj.think_lens,
+            full_lens=recv_obj.full_lens,
             cached_tokens=recv_obj.cached_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,

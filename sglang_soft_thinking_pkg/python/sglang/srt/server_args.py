@@ -203,6 +203,7 @@ class ServerArgs:
     enable_soft_thinking: bool = False
     think_end_str: str = "</think>"
     max_topk: int = 30
+    disable_think_prefix_cache: bool = False
     add_noise_dirichlet: bool = False
     add_noise_gumbel_softmax: bool = False
     # ==========
@@ -1192,6 +1193,11 @@ class ServerArgs:
             "--max-topk",
             type=int,
             default=ServerArgs.max_topk,
+        )
+        parser.add_argument(
+            "--disable-think-prefix-cache",
+            action="store_true",
+            help="Disable prefix caching for replay soft-thinking tokens.",
         )
         # ==========
         # end of soft thinking

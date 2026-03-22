@@ -432,6 +432,7 @@ class Scheduler(
         # ==========
         self.enable_soft_thinking = server_args.enable_soft_thinking
         self.max_topk = server_args.max_topk
+        self.disable_think_prefix_cache = server_args.disable_think_prefix_cache
         # ==========
         # end of soft thinking
         # ==========
@@ -767,6 +768,43 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        replay_trace = recv_req.soft_thinking_trace
+        if replay_trace is not None and (
+            self.enable_overlap
+            or self.is_mixed_chunk
+            or self.chunked_prefill_size is not None
+        ):
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                return_logprob=recv_req.return_logprob,
+                top_logprobs_num=recv_req.top_logprobs_num,
+                token_ids_logprob=recv_req.token_ids_logprob,
+                stream=recv_req.stream,
+                lora_path=recv_req.lora_path,
+                input_embeds=recv_req.input_embeds,
+                custom_logit_processor=recv_req.custom_logit_processor,
+                return_hidden_states=recv_req.return_hidden_states,
+                eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
+                bootstrap_room=recv_req.bootstrap_room,
+                enable_soft_thinking=self.enable_soft_thinking,
+                max_topk=self.max_topk,
+                enable_think_prefix_cache=not self.disable_think_prefix_cache,
+            )
+            req.finished_reason = FINISH_ABORT(
+                "soft_thinking_trace replay is not supported with overlap or mixed-chunk scheduling in v1, "
+                "and also requires chunked prefill to be disabled. "
+                "Please launch with --disable-overlap-schedule and --chunked-prefill-size=-1.",
+                HTTPStatus.BAD_REQUEST,
+                "BadRequestError",
+            )
+            self._add_request_to_queue(req)
+            return
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -792,10 +830,16 @@ class Scheduler(
                 )
                 custom_logit_processor = None
 
+            replay_prompt_len = len(recv_req.input_ids)
+            origin_input_ids = list(recv_req.input_ids)
+            if replay_trace is not None:
+                replay_token_ids = [int(row[0]) for row in replay_trace["topk_indices"]]
+                origin_input_ids = origin_input_ids + replay_token_ids
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                recv_req.input_ids,
+                origin_input_ids,
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
@@ -811,6 +855,9 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 enable_soft_thinking=self.enable_soft_thinking,
                 max_topk=self.max_topk,
+                enable_think_prefix_cache=not self.disable_think_prefix_cache,
+                soft_thinking_trace=replay_trace,
+                soft_thinking_replay_prompt_len=replay_prompt_len,
             )
             req.tokenizer = self.tokenizer
 
@@ -826,7 +873,13 @@ class Scheduler(
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
-            req = session.create_req(recv_req, self.tokenizer)
+            req = session.create_req(
+                recv_req,
+                self.tokenizer,
+                enable_soft_thinking=self.enable_soft_thinking,
+                max_topk=self.max_topk,
+                enable_think_prefix_cache=not self.disable_think_prefix_cache,
+            )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return

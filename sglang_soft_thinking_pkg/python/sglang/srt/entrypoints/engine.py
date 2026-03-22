@@ -81,6 +81,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
 
+SoftThinkingTrace = Dict[str, List[List[Union[int, float]]]]
+
 
 def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
     """Return a usable event loop for synchronous APIs.
@@ -180,6 +182,11 @@ class Engine(EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        # Optional replay trace for soft-thinking prefix.
+        # Format: {"topk_indices": List[List[int]], "topk_probs": List[List[float]]}
+        soft_thinking_trace: Optional[
+            Union[List[Optional[SoftThinkingTrace]], SoftThinkingTrace]
+        ] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -198,6 +205,7 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            soft_thinking_trace=soft_thinking_trace,
             return_hidden_states=return_hidden_states,
             stream=stream,
         )
@@ -245,6 +253,11 @@ class Engine(EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        # Optional replay trace for soft-thinking prefix.
+        # Format: {"topk_indices": List[List[int]], "topk_probs": List[List[float]]}
+        soft_thinking_trace: Optional[
+            Union[List[Optional[SoftThinkingTrace]], SoftThinkingTrace]
+        ] = None,
         stream: bool = False,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
@@ -263,6 +276,7 @@ class Engine(EngineBase):
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
+            soft_thinking_trace=soft_thinking_trace,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

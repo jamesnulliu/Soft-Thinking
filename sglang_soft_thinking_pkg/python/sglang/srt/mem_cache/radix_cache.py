@@ -125,10 +125,10 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
 
-    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
+    def match_prefix(self, key: List, **kwargs) -> Tuple[torch.Tensor, int]:
         """Find the matching prefix from the radix tree.
         Args:
-            key: A list of token IDs to find a matching prefix.
+            key: A list of cache-key elements to find a matching prefix.
         Returns:
             A tuple of a tensor of matching prefix token IDs and
             the last node that contains the prefix values. Note that
@@ -177,6 +177,7 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        cache_keys = req.get_prefix_cache_keys(token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -191,7 +192,7 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
+            cache_keys[:page_aligned_len], page_aligned_kv_indices
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
@@ -206,6 +207,7 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = req.fill_ids
+        cache_keys = req.get_prefix_cache_keys(token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -216,16 +218,16 @@ class RadixCache(BasePrefixCache):
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.clone()
-        page_aligned_token_ids = token_ids[:page_aligned_len]
+        page_aligned_cache_keys = cache_keys[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(page_aligned_cache_keys, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node = self.match_prefix(page_aligned_cache_keys)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],

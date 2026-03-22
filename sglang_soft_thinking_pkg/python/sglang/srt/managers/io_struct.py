@@ -99,6 +99,9 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    # Optional replay trace for soft-thinking prefix.
+    # Format: {"topk_indices": List[List[int]], "topk_probs": List[List[float]]}
+    soft_thinking_trace: Optional[Union[List[Optional[Dict]], Dict]] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -221,6 +224,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_soft_thinking_trace(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -362,6 +366,32 @@ class GenerateReqInput:
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_soft_thinking_trace(self, num):
+        """Normalize soft-thinking replay traces for batch processing."""
+        if self.soft_thinking_trace is None:
+            self.soft_thinking_trace = [None] * num
+        elif isinstance(self.soft_thinking_trace, dict):
+            self.soft_thinking_trace = [
+                copy.deepcopy(self.soft_thinking_trace) for _ in range(num)
+            ]
+        elif isinstance(self.soft_thinking_trace, list):
+            if len(self.soft_thinking_trace) != self.batch_size:
+                raise ValueError(
+                    "The length of soft_thinking_trace should be equal to the batch size."
+                )
+            if self.parallel_sample_num > 1:
+                self.soft_thinking_trace = [
+                    copy.deepcopy(x)
+                    for x in self.soft_thinking_trace
+                    for _ in range(self.parallel_sample_num)
+                ]
+            else:
+                self.soft_thinking_trace = [
+                    copy.deepcopy(x) for x in self.soft_thinking_trace
+                ]
+        else:
+            raise ValueError("soft_thinking_trace should be a dict or a list.")
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -406,6 +436,11 @@ class GenerateReqInput:
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
+            soft_thinking_trace=(
+                copy.deepcopy(self.soft_thinking_trace[i])
+                if self.soft_thinking_trace is not None
+                else None
             ),
         )
 
@@ -453,6 +488,8 @@ class TokenizedGenerateReqInput:
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    # Optional replay trace for soft-thinking prefix.
+    soft_thinking_trace: Optional[Dict[str, List[List[Union[int, float]]]]] = None
 
 
 @dataclass
@@ -581,6 +618,8 @@ class BatchTokenIDOut:
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
+    think_lens: List[int]
+    full_lens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
 
@@ -640,6 +679,8 @@ class BatchStrOut:
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
+    think_lens: List[int]
+    full_lens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
 
