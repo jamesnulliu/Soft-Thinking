@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
-def _generate_with_obj(llm: sgl.Engine, obj: GenerateReqInput) -> Dict[str, Any]:
+def _generate_with_obj(llm: sgl.Engine, obj: GenerateReqInput) -> Any:
     return llm.generate(
         prompt=obj.text,
         input_ids=obj.input_ids,
@@ -28,6 +28,12 @@ def _generate_with_obj(llm: sgl.Engine, obj: GenerateReqInput) -> Dict[str, Any]
         stream=obj.stream,
         soft_thinking_trace=obj.soft_thinking_trace,
     )
+
+
+def _ensure_output_list(outputs: Any) -> List[Dict[str, Any]]:
+    if isinstance(outputs, list):
+        return outputs
+    return [outputs]
 
 
 def _extract_text(output: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
@@ -131,6 +137,27 @@ def _serialize_finish_reason(meta_info: Dict[str, Any]) -> Optional[Dict[str, An
     return {"type": str(finish_reason)}
 
 
+def _build_repetition_records(
+    outputs: List[Dict[str, Any]],
+    tokenizer: AutoTokenizer,
+    batch_elapsed_sec: float,
+) -> List[Dict[str, Any]]:
+    repetitions = []
+    for repeat_idx, out in enumerate(outputs):
+        meta_info = out["meta_info"]
+        repetitions.append(
+            {
+                "repeat_idx": repeat_idx,
+                "elapsed_sec": batch_elapsed_sec,
+                "completion_tokens": int(meta_info.get("completion_tokens", 0)),
+                "cached_tokens": int(meta_info.get("cached_tokens", 0)),
+                "finish_reason": _serialize_finish_reason(meta_info),
+                "text": _extract_text(out, tokenizer),
+            }
+        )
+    return repetitions
+
+
 def _capture_trace_until_think_end(
     llm: sgl.Engine,
     tokenizer: AutoTokenizer,
@@ -206,30 +233,22 @@ def _run_normal_softthinking(
     for sample_idx, sample in enumerate(samples):
         question = sample["problem"]
         prompt = _build_prompt(tokenizer, question)
+        prompt_batch = [prompt] * k
 
         sample_start = time.perf_counter()
-        repetitions = []
-        for repeat_idx in range(k):
-            rep_start = time.perf_counter()
-            out = llm.generate(
-                prompt=prompt,
-                sampling_params=copy.deepcopy(sampling_params),
-                return_logprob=False,
-            )
-            elapsed = time.perf_counter() - rep_start
-            meta_info = out["meta_info"]
-            repetitions.append(
-                {
-                    "repeat_idx": repeat_idx,
-                    "elapsed_sec": elapsed,
-                    "completion_tokens": int(meta_info.get("completion_tokens", 0)),
-                    "cached_tokens": int(meta_info.get("cached_tokens", 0)),
-                    "finish_reason": _serialize_finish_reason(meta_info),
-                    "text": _extract_text(out, tokenizer),
-                }
+        batch_out = llm.generate(
+            prompt=prompt_batch,
+            sampling_params=copy.deepcopy(sampling_params),
+            return_logprob=False,
+        )
+        sample_elapsed = time.perf_counter() - sample_start
+        outputs = _ensure_output_list(batch_out)
+        if len(outputs) != k:
+            raise AssertionError(
+                f"Expected {k} outputs for batched normal generation, got {len(outputs)}"
             )
 
-        sample_elapsed = time.perf_counter() - sample_start
+        repetitions = _build_repetition_records(outputs, tokenizer, sample_elapsed)
         per_sample.append(
             {
                 "sample_idx": sample_idx,
@@ -240,12 +259,13 @@ def _run_normal_softthinking(
                 "total_elapsed_sec": sample_elapsed,
                 "replay_trace_len": 0,
                 "think_end_step": None,
+                "batched_request_size": k,
                 "repetitions": repetitions,
             }
         )
         print(
             f"[normal_soft_thinking] sample={sample_idx} total={sample_elapsed:.3f}s "
-            f"avg_per_repeat={sample_elapsed / k:.3f}s"
+            f"effective_avg_per_repeat={sample_elapsed / k:.3f}s batch_size={k}"
         )
 
     total_elapsed = time.perf_counter() - method_start
@@ -276,31 +296,22 @@ def _run_replay_method(
             sampling_params=sampling_params,
         )
 
+        replay_obj = GenerateReqInput(
+            input_ids=[copy.deepcopy(prompt_ids) for _ in range(k)],
+            sampling_params=copy.deepcopy(sampling_params),
+            return_logprob=False,
+            soft_thinking_trace=copy.deepcopy(warmup["replay_trace"]),
+        )
         replay_start = time.perf_counter()
-        repetitions = []
-        for repeat_idx in range(k):
-            obj = GenerateReqInput(
-                input_ids=prompt_ids,
-                sampling_params=copy.deepcopy(sampling_params),
-                return_logprob=False,
-                soft_thinking_trace=copy.deepcopy(warmup["replay_trace"]),
-            )
-            rep_start = time.perf_counter()
-            out = _generate_with_obj(llm, obj)
-            elapsed = time.perf_counter() - rep_start
-            meta_info = out["meta_info"]
-            repetitions.append(
-                {
-                    "repeat_idx": repeat_idx,
-                    "elapsed_sec": elapsed,
-                    "completion_tokens": int(meta_info.get("completion_tokens", 0)),
-                    "cached_tokens": int(meta_info.get("cached_tokens", 0)),
-                    "finish_reason": _serialize_finish_reason(meta_info),
-                    "text": _extract_text(out, tokenizer),
-                }
+        replay_out = _generate_with_obj(llm, replay_obj)
+        replay_elapsed = time.perf_counter() - replay_start
+        outputs = _ensure_output_list(replay_out)
+        if len(outputs) != k:
+            raise AssertionError(
+                f"Expected {k} outputs for batched replay generation, got {len(outputs)}"
             )
 
-        replay_elapsed = time.perf_counter() - replay_start
+        repetitions = _build_repetition_records(outputs, tokenizer, replay_elapsed)
         total_elapsed = warmup["elapsed_sec"] + replay_elapsed
         per_sample.append(
             {
@@ -316,13 +327,14 @@ def _run_replay_method(
                 "warmup_completion_tokens": warmup["completion_tokens"],
                 "warmup_cached_tokens": warmup["cached_tokens"],
                 "warmup_text": warmup["text"],
+                "batched_request_size": k,
                 "repetitions": repetitions,
             }
         )
         print(
             f"[{method_name}] sample={sample_idx} warmup={warmup['elapsed_sec']:.3f}s "
             f"replay_total={replay_elapsed:.3f}s total={total_elapsed:.3f}s "
-            f"avg_per_repeat={replay_elapsed / k:.3f}s"
+            f"effective_avg_per_repeat={replay_elapsed / k:.3f}s batch_size={k}"
         )
 
     total_elapsed = time.perf_counter() - method_start
