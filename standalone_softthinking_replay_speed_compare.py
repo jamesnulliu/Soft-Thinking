@@ -121,9 +121,43 @@ def _load_aime24_samples(limit: int) -> List[Dict[str, Any]]:
     return samples[: min(limit, len(samples))]
 
 
-def _find_think_end_step(topk_indices: List[List[int]], think_end_id: int) -> Optional[int]:
+def _find_subsequence_start(haystack: List[int], needle: List[int]) -> Optional[int]:
+    if not needle or len(needle) > len(haystack):
+        return None
+    end = len(haystack) - len(needle) + 1
+    for start in range(end):
+        if haystack[start : start + len(needle)] == needle:
+            return start
+    return None
+
+
+def _normalize_output_ids(raw_output_ids: Any) -> Optional[List[int]]:
+    if raw_output_ids is None:
+        return None
+    if not isinstance(raw_output_ids, list):
+        return None
+    if raw_output_ids and isinstance(raw_output_ids[0], list):
+        raw_output_ids = raw_output_ids[0]
+    if not all(isinstance(x, int) for x in raw_output_ids):
+        return None
+    return [int(x) for x in raw_output_ids]
+
+
+def _find_think_end_step(
+    topk_indices: List[List[int]],
+    think_end_ids: List[int],
+    output_ids: Optional[List[int]],
+) -> Optional[int]:
+    # Prefer searching generated token IDs so we do not depend on think-end being top-1.
+    if output_ids:
+        think_end_start = _find_subsequence_start(output_ids, think_end_ids)
+        if think_end_start is not None:
+            return think_end_start
+
+    # Fallback: search top-k rows for the final think-end token.
+    think_end_id = think_end_ids[-1]
     for step, row in enumerate(topk_indices):
-        if row and int(row[0]) == think_end_id:
+        if row and any(int(idx) == think_end_id for idx in row):
             return step
     return None
 
@@ -193,12 +227,82 @@ def _capture_trace_until_think_end(
             f"Tokenizer could not encode think_end_str={sampling_params['think_end_str']}"
         )
 
-    think_end_id = think_end_ids[-1]
-    think_end_step = _find_think_end_step(topk_indices, think_end_id)
+    finish_reason = _serialize_finish_reason(meta_info)
+    think_end_str = sampling_params["think_end_str"]
+    if (
+        finish_reason is None
+        or finish_reason.get("type") != "stop"
+        or finish_reason.get("matched") != think_end_str
+    ):
+        raise AssertionError(
+            "Warmup consistency check failed: expected finish_reason to match "
+            f"think_end_str={think_end_str!r}, got finish_reason={finish_reason}."
+        )
+
+    think_end_step: Optional[int] = None
+
+    # Prefer server-side think_len/full_len metadata. It is computed from real
+    # output_ids in scheduler and remains valid even if the last stop token is
+    # not present in output_topk_idx_list.
+    think_len_raw = meta_info.get("think_len")
+    full_len_raw = meta_info.get("full_len")
+    try:
+        think_len = int(think_len_raw) if think_len_raw is not None else None
+        full_len = int(full_len_raw) if full_len_raw is not None else None
+    except (TypeError, ValueError):
+        think_len = None
+        full_len = None
+
+    if think_len is None or full_len is None:
+        raise AssertionError(
+            "Warmup consistency check failed: missing think_len/full_len in meta_info. "
+            f"think_len={think_len_raw}, full_len={full_len_raw}, finish_reason={finish_reason}"
+        )
+    if not (0 <= think_len < full_len):
+        raise AssertionError(
+            "Warmup consistency check failed: invalid think_len/full_len relation. "
+            f"think_len={think_len}, full_len={full_len}, finish_reason={finish_reason}"
+        )
+    if think_len != full_len - 1:
+        raise AssertionError(
+            "Warmup consistency check failed: expected </think> to be the last generated token "
+            f"under stop='</think>', got think_len={think_len}, full_len={full_len}."
+        )
+
+    topk_len = len(topk_indices)
+    if topk_len not in (think_len, full_len):
+        raise AssertionError(
+            "Warmup consistency check failed: unexpected top-k trace length. "
+            f"topk_len={topk_len}, think_len={think_len}, full_len={full_len}"
+        )
+    if len(topk_probs) != topk_len:
+        raise AssertionError(
+            "Warmup consistency check failed: top-k indices/probs length mismatch. "
+            f"len(topk_indices)={topk_len}, len(topk_probs)={len(topk_probs)}"
+        )
+
+    if think_len <= len(topk_indices):
+        think_end_step = think_len
+    else:
+        output_ids = _normalize_output_ids(warmup_out.get("output_ids"))
+        think_end_step = _find_think_end_step(
+            topk_indices=topk_indices,
+            think_end_ids=think_end_ids,
+            output_ids=output_ids,
+        )
+
     if think_end_step is None:
+        text_preview = _extract_text(warmup_out, tokenizer)[:200]
+        output_ids = _normalize_output_ids(warmup_out.get("output_ids"))
+        output_ids_tail = output_ids[-16:] if output_ids else None
         raise AssertionError(
             "Warmup run did not reach the think-end boundary. "
-            "Try increasing --max-new-tokens or checking the model's thinking format."
+            f"finish_reason={finish_reason}, "
+            f"think_end_ids={think_end_ids}, "
+            f"think_len={think_len_raw}, "
+            f"full_len={full_len_raw}, "
+            f"output_ids_tail={output_ids_tail}, "
+            f"preview={text_preview!r}"
         )
 
     replay_trace = {
