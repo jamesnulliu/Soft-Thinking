@@ -44,6 +44,15 @@ def _extract_text(output: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
     return ""
 
 
+def _extract_text_after_think(text: str, think_end_str: str) -> str:
+    if not text or not think_end_str:
+        return ""
+    if think_end_str not in text:
+        # Replay requests may already start after thinking and contain no explicit </think>.
+        return text.strip()
+    return text.split(think_end_str, 1)[1].strip()
+
+
 def _build_engine_args(
     model_path: str,
     tp_size: int,
@@ -175,10 +184,12 @@ def _build_repetition_records(
     outputs: List[Dict[str, Any]],
     tokenizer: AutoTokenizer,
     batch_elapsed_sec: float,
+    think_end_str: str,
 ) -> List[Dict[str, Any]]:
     repetitions = []
     for repeat_idx, out in enumerate(outputs):
         meta_info = out["meta_info"]
+        decoded_text = _extract_text(out, tokenizer)
         repetitions.append(
             {
                 "repeat_idx": repeat_idx,
@@ -186,30 +197,19 @@ def _build_repetition_records(
                 "completion_tokens": int(meta_info.get("completion_tokens", 0)),
                 "cached_tokens": int(meta_info.get("cached_tokens", 0)),
                 "finish_reason": _serialize_finish_reason(meta_info),
-                "text": _extract_text(out, tokenizer),
+                "text_after_think": _extract_text_after_think(
+                    decoded_text, think_end_str
+                ),
             }
         )
     return repetitions
 
 
-def _capture_trace_until_think_end(
-    llm: sgl.Engine,
+def _extract_warmup_result(
+    warmup_out: Dict[str, Any],
     tokenizer: AutoTokenizer,
-    prompt: str,
-    prompt_ids: List[int],
     sampling_params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    warmup_params = copy.deepcopy(sampling_params)
-    warmup_params["stop"] = sampling_params["think_end_str"]
-
-    start = time.perf_counter()
-    warmup_out = llm.generate(
-        prompt=prompt,
-        sampling_params=warmup_params,
-        return_logprob=True,
-    )
-    elapsed = time.perf_counter() - start
-
     meta_info = warmup_out["meta_info"]
     topk_indices = meta_info.get("output_topk_idx_list", [])
     topk_probs = meta_info.get("output_topk_prob_list", [])
@@ -310,16 +310,17 @@ def _capture_trace_until_think_end(
         "topk_probs": copy.deepcopy(topk_probs[:think_end_step]),
     }
 
+    warmup_decoded_text = _extract_text(warmup_out, tokenizer)
     return {
-        "elapsed_sec": elapsed,
-        "prompt_tokens": len(prompt_ids),
         "completion_tokens": int(meta_info.get("completion_tokens", len(topk_indices))),
         "cached_tokens": int(meta_info.get("cached_tokens", 0)),
         "finish_reason": _serialize_finish_reason(meta_info),
         "trace_steps_total": len(topk_indices),
         "replay_trace_len": len(replay_trace["topk_indices"]),
         "think_end_step": think_end_step,
-        "text": _extract_text(warmup_out, tokenizer),
+        "text_after_think": _extract_text_after_think(
+            warmup_decoded_text, sampling_params["think_end_str"]
+        ),
         "replay_trace": replay_trace,
     }
 
@@ -333,43 +334,67 @@ def _run_normal_softthinking(
 ) -> Dict[str, Any]:
     per_sample = []
     method_start = time.perf_counter()
-
+    prompts = []
+    request_to_sample_idx = []
     for sample_idx, sample in enumerate(samples):
-        question = sample["problem"]
-        prompt = _build_prompt(tokenizer, question)
-        prompt_batch = [prompt] * k
+        prompt = _build_prompt(tokenizer, sample["problem"])
+        for _ in range(k):
+            prompts.append(prompt)
+            request_to_sample_idx.append(sample_idx)
 
-        sample_start = time.perf_counter()
-        batch_out = llm.generate(
-            prompt=prompt_batch,
-            sampling_params=copy.deepcopy(sampling_params),
-            return_logprob=False,
+    if not prompts:
+        return _build_method_summary("normal_soft_thinking", [], 0.0)
+
+    batch_start = time.perf_counter()
+    batch_out = llm.generate(
+        prompt=prompts,
+        sampling_params=copy.deepcopy(sampling_params),
+        return_logprob=False,
+    )
+    batch_elapsed = time.perf_counter() - batch_start
+    outputs = _ensure_output_list(batch_out)
+    expected = len(prompts)
+    if len(outputs) != expected:
+        raise AssertionError(
+            f"Expected {expected} outputs for global normal-generation batch, got {len(outputs)}"
         )
-        sample_elapsed = time.perf_counter() - sample_start
-        outputs = _ensure_output_list(batch_out)
-        if len(outputs) != k:
+
+    grouped_outputs: List[List[Dict[str, Any]]] = [[] for _ in samples]
+    for out, sample_idx in zip(outputs, request_to_sample_idx):
+        grouped_outputs[sample_idx].append(out)
+
+    total_outputs = len(outputs)
+    for sample_idx, sample in enumerate(samples):
+        sample_outputs = grouped_outputs[sample_idx]
+        if len(sample_outputs) != k:
             raise AssertionError(
-                f"Expected {k} outputs for batched normal generation, got {len(outputs)}"
+                f"Expected {k} outputs for sample {sample_idx} in normal mode, got {len(sample_outputs)}"
             )
 
-        repetitions = _build_repetition_records(outputs, tokenizer, sample_elapsed)
+        sample_elapsed = batch_elapsed * len(sample_outputs) / total_outputs
+        repetitions = _build_repetition_records(
+            sample_outputs,
+            tokenizer,
+            sample_elapsed,
+            sampling_params["think_end_str"],
+        )
         per_sample.append(
             {
                 "sample_idx": sample_idx,
-                "question": question,
+                "question": sample["problem"],
                 "ground_truth": sample.get("answer", sample.get("final_answer")),
                 "warmup_elapsed_sec": 0.0,
                 "generation_elapsed_sec": sample_elapsed,
                 "total_elapsed_sec": sample_elapsed,
                 "replay_trace_len": 0,
                 "think_end_step": None,
-                "batched_request_size": k,
+                "batched_request_size": expected,
                 "repetitions": repetitions,
             }
         )
         print(
             f"[normal_soft_thinking] sample={sample_idx} total={sample_elapsed:.3f}s "
-            f"effective_avg_per_repeat={sample_elapsed / k:.3f}s batch_size={k}"
+            f"effective_avg_per_repeat={sample_elapsed / k:.3f}s global_batch_size={expected}"
         )
 
     total_elapsed = time.perf_counter() - method_start
@@ -383,66 +408,149 @@ def _run_replay_method(
     sampling_params: Dict[str, Any],
     k: int,
     method_name: str,
+    warmup_batch_size: int,
 ) -> Dict[str, Any]:
-    per_sample = []
-    method_start = time.perf_counter()
+    if warmup_batch_size <= 0:
+        raise ValueError("warmup_batch_size must be a positive integer.")
 
+    if not samples:
+        return _build_method_summary(method_name, [], 0.0)
+
+    per_sample: List[Optional[Dict[str, Any]]] = [None] * len(samples)
+    method_start = time.perf_counter()
+    sample_infos: List[Dict[str, Any]] = []
     for sample_idx, sample in enumerate(samples):
         question = sample["problem"]
         prompt = _build_prompt(tokenizer, question)
-        prompt_ids = tokenizer.encode(prompt)
-
-        warmup = _capture_trace_until_think_end(
-            llm=llm,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-        )
-
-        replay_obj = GenerateReqInput(
-            input_ids=[copy.deepcopy(prompt_ids) for _ in range(k)],
-            sampling_params=copy.deepcopy(sampling_params),
-            return_logprob=False,
-            soft_thinking_trace=copy.deepcopy(warmup["replay_trace"]),
-        )
-        replay_start = time.perf_counter()
-        replay_out = _generate_with_obj(llm, replay_obj)
-        replay_elapsed = time.perf_counter() - replay_start
-        outputs = _ensure_output_list(replay_out)
-        if len(outputs) != k:
-            raise AssertionError(
-                f"Expected {k} outputs for batched replay generation, got {len(outputs)}"
-            )
-
-        repetitions = _build_repetition_records(outputs, tokenizer, replay_elapsed)
-        total_elapsed = warmup["elapsed_sec"] + replay_elapsed
-        per_sample.append(
+        sample_infos.append(
             {
                 "sample_idx": sample_idx,
                 "question": question,
                 "ground_truth": sample.get("answer", sample.get("final_answer")),
-                "warmup_elapsed_sec": warmup["elapsed_sec"],
-                "generation_elapsed_sec": replay_elapsed,
-                "total_elapsed_sec": total_elapsed,
-                "replay_trace_len": warmup["replay_trace_len"],
-                "think_end_step": warmup["think_end_step"],
-                "warmup_finish_reason": warmup["finish_reason"],
-                "warmup_completion_tokens": warmup["completion_tokens"],
-                "warmup_cached_tokens": warmup["cached_tokens"],
-                "warmup_text": warmup["text"],
-                "batched_request_size": k,
-                "repetitions": repetitions,
+                "prompt": prompt,
+                "prompt_ids": tokenizer.encode(prompt),
             }
         )
+
+    warmup_params = copy.deepcopy(sampling_params)
+    warmup_params["stop"] = sampling_params["think_end_str"]
+    warmup_info_by_sample_idx: Dict[int, Dict[str, Any]] = {}
+
+    for start_idx in range(0, len(sample_infos), warmup_batch_size):
+        chunk = sample_infos[start_idx : start_idx + warmup_batch_size]
+        chunk_prompts = [item["prompt"] for item in chunk]
+
+        warmup_start = time.perf_counter()
+        warmup_out = llm.generate(
+            prompt=chunk_prompts,
+            sampling_params=copy.deepcopy(warmup_params),
+            return_logprob=True,
+        )
+        warmup_elapsed = time.perf_counter() - warmup_start
+        warmup_outputs = _ensure_output_list(warmup_out)
+        if len(warmup_outputs) != len(chunk):
+            raise AssertionError(
+                "Expected {} warmup outputs for chunk, got {}".format(
+                    len(chunk), len(warmup_outputs)
+                )
+            )
+
+        warmup_infos: List[Dict[str, Any]] = []
+        warmup_elapsed_per_req = warmup_elapsed / len(chunk)
+        for out in warmup_outputs:
+            info = _extract_warmup_result(
+                warmup_out=out,
+                tokenizer=tokenizer,
+                sampling_params=sampling_params,
+            )
+            info["elapsed_sec"] = warmup_elapsed_per_req
+            warmup_infos.append(info)
+
+        for local_idx, sample_info in enumerate(chunk):
+            sample_idx = sample_info["sample_idx"]
+            warmup = warmup_infos[local_idx]
+            warmup["warmup_batch_size"] = len(chunk)
+            warmup_info_by_sample_idx[sample_idx] = warmup
+
+    replay_input_ids: List[List[int]] = []
+    replay_traces: List[Dict[str, Any]] = []
+    replay_to_sample_idx: List[int] = []
+    for sample_info in sample_infos:
+        sample_idx = sample_info["sample_idx"]
+        warmup = warmup_info_by_sample_idx[sample_idx]
+        trace = warmup["replay_trace"]
+        for _ in range(k):
+            replay_input_ids.append(copy.deepcopy(sample_info["prompt_ids"]))
+            replay_traces.append(copy.deepcopy(trace))
+            replay_to_sample_idx.append(sample_idx)
+
+    replay_obj = GenerateReqInput(
+        input_ids=replay_input_ids,
+        sampling_params=copy.deepcopy(sampling_params),
+        return_logprob=False,
+        soft_thinking_trace=replay_traces,
+    )
+
+    replay_start = time.perf_counter()
+    replay_out = _generate_with_obj(llm, replay_obj)
+    replay_elapsed = time.perf_counter() - replay_start
+    replay_outputs = _ensure_output_list(replay_out)
+    expected_replay = len(replay_input_ids)
+    if len(replay_outputs) != expected_replay:
+        raise AssertionError(
+            f"Expected {expected_replay} outputs for global replay batch, got {len(replay_outputs)}"
+        )
+
+    grouped_replay_outputs: Dict[int, List[Dict[str, Any]]] = {
+        sample_info["sample_idx"]: [] for sample_info in sample_infos
+    }
+    for out, sample_idx in zip(replay_outputs, replay_to_sample_idx):
+        grouped_replay_outputs[sample_idx].append(out)
+
+    for sample_info in sample_infos:
+        sample_idx = sample_info["sample_idx"]
+        sample_outputs = grouped_replay_outputs[sample_idx]
+        if len(sample_outputs) != k:
+            raise AssertionError(
+                f"Expected {k} replay outputs for sample {sample_idx}, got {len(sample_outputs)}"
+            )
+
+        sample_replay_elapsed = replay_elapsed * len(sample_outputs) / expected_replay
+        repetitions = _build_repetition_records(
+            sample_outputs,
+            tokenizer,
+            sample_replay_elapsed,
+            sampling_params["think_end_str"],
+        )
+
+        warmup = warmup_info_by_sample_idx[sample_idx]
+        sample_total_elapsed = warmup["elapsed_sec"] + sample_replay_elapsed
+        per_sample[sample_idx] = {
+            "sample_idx": sample_idx,
+            "question": sample_info["question"],
+            "ground_truth": sample_info["ground_truth"],
+            "warmup_elapsed_sec": warmup["elapsed_sec"],
+            "generation_elapsed_sec": sample_replay_elapsed,
+            "total_elapsed_sec": sample_total_elapsed,
+            "replay_trace_len": warmup["replay_trace_len"],
+            "think_end_step": warmup["think_end_step"],
+            "warmup_finish_reason": warmup["finish_reason"],
+            "warmup_completion_tokens": warmup["completion_tokens"],
+            "warmup_cached_tokens": warmup["cached_tokens"],
+            "warmup_text_after_think": warmup["text_after_think"],
+            "batched_request_size": expected_replay,
+            "warmup_batch_size": warmup["warmup_batch_size"],
+            "repetitions": repetitions,
+        }
         print(
             f"[{method_name}] sample={sample_idx} warmup={warmup['elapsed_sec']:.3f}s "
-            f"replay_total={replay_elapsed:.3f}s total={total_elapsed:.3f}s "
-            f"effective_avg_per_repeat={replay_elapsed / k:.3f}s batch_size={k}"
+            f"replay_total={sample_replay_elapsed:.3f}s total={sample_total_elapsed:.3f}s "
+            f"effective_avg_per_repeat={sample_replay_elapsed / k:.3f}s replay_batch_size={expected_replay}"
         )
 
     total_elapsed = time.perf_counter() - method_start
-    return _build_method_summary(method_name, per_sample, total_elapsed)
+    finalized = [item for item in per_sample if item is not None]
+    return _build_method_summary(method_name, finalized, total_elapsed)
 
 
 def _build_method_summary(
@@ -514,6 +622,44 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     )
 
 
+def _build_decoded_after_think_payload(
+    all_results: Dict[str, Any], think_end_str: str
+) -> Dict[str, Any]:
+    methods_payload = []
+    for method_summary in all_results.get("results", []):
+        sample_payload = []
+        for sample in method_summary.get("samples", []):
+            repeats = sample.get("repetitions", [])
+            decoded_repetitions = [
+                {
+                    "repeat_idx": int(rep.get("repeat_idx", idx)),
+                    "text_after_think": str(rep.get("text_after_think", "")),
+                }
+                for idx, rep in enumerate(repeats)
+            ]
+            sample_payload.append(
+                {
+                    "sample_idx": int(sample.get("sample_idx", -1)),
+                    "question": sample.get("question"),
+                    "ground_truth": sample.get("ground_truth"),
+                    "decoded_after_think": decoded_repetitions,
+                }
+            )
+
+        methods_payload.append(
+            {
+                "method": method_summary.get("method"),
+                "samples": sample_payload,
+            }
+        )
+
+    return {
+        "think_end_str": think_end_str,
+        "config": all_results.get("config", {}),
+        "methods": methods_payload,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare normal soft-thinking against replay with and without cached thinking on AIME24."
@@ -544,7 +690,7 @@ def main() -> None:
     parser.add_argument("--after-thinking-min-p", type=float, default=0.0)
     parser.add_argument("--think-end-str", type=str, default="</think>")
     parser.add_argument(
-        "--early-stopping-entropy-threshold", type=float, default=0.0
+        "--early-stopping-entropy-threshold", type=float, default=0.01
     )
     parser.add_argument("--early-stopping-length-threshold", type=int, default=256)
     parser.add_argument(
@@ -552,6 +698,20 @@ def main() -> None:
         type=str,
         default=None,
         help="Optional path to save the full benchmark results as JSON.",
+    )
+    parser.add_argument(
+        "--decoded-after-think-json",
+        type=str,
+        default="decoded_after_think.json",
+        help=(
+            "Path to save decoded text after </think> for every method/sample/repetition."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-batch-size",
+        type=int,
+        default=5,
+        help="Maximum number of questions to warm up together before batched replay.",
     )
     args = parser.parse_args()
 
@@ -626,6 +786,7 @@ def main() -> None:
                     sampling_params=sampling_params,
                     k=args.k,
                     method_name=method_name,
+                    warmup_batch_size=args.warmup_batch_size,
                 )
         finally:
             llm.shutdown()
@@ -640,6 +801,16 @@ def main() -> None:
             json.dump(all_results, f, indent=2)
         print()
         print(f"Saved benchmark results to {output_path}")
+
+    decoded_path = Path(args.decoded_after_think_json)
+    decoded_path.parent.mkdir(parents=True, exist_ok=True)
+    decoded_payload = _build_decoded_after_think_payload(
+        all_results=all_results, think_end_str=args.think_end_str
+    )
+    with decoded_path.open("w", encoding="utf-8") as f:
+        json.dump(decoded_payload, f, indent=2)
+    print()
+    print(f"Saved decoded post-think text to {decoded_path}")
 
 
 if __name__ == "__main__":
