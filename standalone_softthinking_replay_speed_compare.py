@@ -472,40 +472,89 @@ def _run_replay_method(
             warmup["warmup_batch_size"] = len(chunk)
             warmup_info_by_sample_idx[sample_idx] = warmup
 
-    replay_input_ids: List[List[int]] = []
-    replay_traces: List[Dict[str, Any]] = []
-    replay_to_sample_idx: List[int] = []
+    replay_base_max_new_tokens = int(sampling_params["max_new_tokens"])
+    replay_units_by_budget: Dict[int, List[Dict[str, Any]]] = {}
+    replay_prefill_tokens_by_sample_idx: Dict[int, int] = {}
+
     for sample_info in sample_infos:
         sample_idx = sample_info["sample_idx"]
         warmup = warmup_info_by_sample_idx[sample_idx]
         trace = warmup["replay_trace"]
-        for _ in range(k):
-            replay_input_ids.append(copy.deepcopy(sample_info["prompt_ids"]))
-            replay_traces.append(copy.deepcopy(trace))
-            replay_to_sample_idx.append(sample_idx)
-
-    replay_obj = GenerateReqInput(
-        input_ids=replay_input_ids,
-        sampling_params=copy.deepcopy(sampling_params),
-        return_logprob=False,
-        soft_thinking_trace=replay_traces,
-    )
-
-    replay_start = time.perf_counter()
-    replay_out = _generate_with_obj(llm, replay_obj)
-    replay_elapsed = time.perf_counter() - replay_start
-    replay_outputs = _ensure_output_list(replay_out)
-    expected_replay = len(replay_input_ids)
-    if len(replay_outputs) != expected_replay:
-        raise AssertionError(
-            f"Expected {expected_replay} outputs for global replay batch, got {len(replay_outputs)}"
+        replay_prefill_tokens = len(sample_info["prompt_ids"]) + int(
+            warmup["replay_trace_len"]
         )
+        replay_prefill_tokens_by_sample_idx[sample_idx] = replay_prefill_tokens
+        replay_max_new_tokens = replay_base_max_new_tokens - replay_prefill_tokens
+        if replay_max_new_tokens <= 0:
+            replay_max_new_tokens = 1
+
+        bucket = replay_units_by_budget.setdefault(replay_max_new_tokens, [])
+        for _ in range(k):
+            bucket.append(
+                {
+                    "sample_idx": sample_idx,
+                    "prompt_ids": sample_info["prompt_ids"],
+                    "replay_trace": trace,
+                }
+            )
 
     grouped_replay_outputs: Dict[int, List[Dict[str, Any]]] = {
         sample_info["sample_idx"]: [] for sample_info in sample_infos
     }
-    for out, sample_idx in zip(replay_outputs, replay_to_sample_idx):
-        grouped_replay_outputs[sample_idx].append(out)
+    replay_elapsed_by_sample_idx: Dict[int, float] = {
+        sample_info["sample_idx"]: 0.0 for sample_info in sample_infos
+    }
+    replay_batch_size_by_sample_idx: Dict[int, int] = {}
+    replay_max_new_tokens_by_sample_idx: Dict[int, int] = {}
+
+    for replay_max_new_tokens, replay_units in replay_units_by_budget.items():
+        replay_input_ids = [copy.deepcopy(unit["prompt_ids"]) for unit in replay_units]
+        replay_traces = [copy.deepcopy(unit["replay_trace"]) for unit in replay_units]
+        bucket_sample_indices = [int(unit["sample_idx"]) for unit in replay_units]
+
+        replay_params = copy.deepcopy(sampling_params)
+        replay_params["max_new_tokens"] = replay_max_new_tokens
+
+        replay_obj = GenerateReqInput(
+            input_ids=replay_input_ids,
+            sampling_params=replay_params,
+            return_logprob=False,
+            soft_thinking_trace=replay_traces,
+        )
+
+        replay_start = time.perf_counter()
+        replay_out = _generate_with_obj(llm, replay_obj)
+        replay_elapsed = time.perf_counter() - replay_start
+        replay_outputs = _ensure_output_list(replay_out)
+        expected_replay = len(replay_input_ids)
+        if len(replay_outputs) != expected_replay:
+            raise AssertionError(
+                f"Expected {expected_replay} outputs for replay batch, got {len(replay_outputs)}"
+            )
+
+        sample_replay_counts: Dict[int, int] = {}
+        for out, sample_idx in zip(replay_outputs, bucket_sample_indices):
+            grouped_replay_outputs[sample_idx].append(out)
+            sample_replay_counts[sample_idx] = sample_replay_counts.get(sample_idx, 0) + 1
+            replay_batch_size_by_sample_idx[sample_idx] = expected_replay
+            replay_max_new_tokens_by_sample_idx[sample_idx] = replay_max_new_tokens
+
+        for sample_idx, sample_count in sample_replay_counts.items():
+            replay_elapsed_by_sample_idx[sample_idx] += (
+                replay_elapsed * sample_count / expected_replay
+            )
+
+        print(
+            f"[{method_name}] replay_bucket max_new_tokens={replay_max_new_tokens} "
+            f"batch_size={expected_replay} elapsed={replay_elapsed:.3f}s"
+        )
+
+    expected_replay_total = len(sample_infos) * k
+    actual_replay_total = sum(len(v) for v in grouped_replay_outputs.values())
+    if actual_replay_total != expected_replay_total:
+        raise AssertionError(
+            f"Expected total {expected_replay_total} replay outputs, got {actual_replay_total}"
+        )
 
     for sample_info in sample_infos:
         sample_idx = sample_info["sample_idx"]
@@ -515,7 +564,7 @@ def _run_replay_method(
                 f"Expected {k} replay outputs for sample {sample_idx}, got {len(sample_outputs)}"
             )
 
-        sample_replay_elapsed = replay_elapsed * len(sample_outputs) / expected_replay
+        sample_replay_elapsed = replay_elapsed_by_sample_idx[sample_idx]
         repetitions = _build_repetition_records(
             sample_outputs,
             tokenizer,
@@ -538,14 +587,18 @@ def _run_replay_method(
             "warmup_completion_tokens": warmup["completion_tokens"],
             "warmup_cached_tokens": warmup["cached_tokens"],
             "warmup_text_after_think": warmup["text_after_think"],
-            "batched_request_size": expected_replay,
+            "replay_prefill_tokens": replay_prefill_tokens_by_sample_idx[sample_idx],
+            "replay_max_new_tokens": replay_max_new_tokens_by_sample_idx[sample_idx],
+            "batched_request_size": replay_batch_size_by_sample_idx[sample_idx],
             "warmup_batch_size": warmup["warmup_batch_size"],
             "repetitions": repetitions,
         }
         print(
             f"[{method_name}] sample={sample_idx} warmup={warmup['elapsed_sec']:.3f}s "
             f"replay_total={sample_replay_elapsed:.3f}s total={sample_total_elapsed:.3f}s "
-            f"effective_avg_per_repeat={sample_replay_elapsed / k:.3f}s replay_batch_size={expected_replay}"
+            f"effective_avg_per_repeat={sample_replay_elapsed / k:.3f}s "
+            f"replay_batch_size={replay_batch_size_by_sample_idx[sample_idx]} "
+            f"replay_max_new_tokens={replay_max_new_tokens_by_sample_idx[sample_idx]}"
         )
 
     total_elapsed = time.perf_counter() - method_start
