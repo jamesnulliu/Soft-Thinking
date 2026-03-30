@@ -590,6 +590,18 @@ class TokenizerManager:
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
+        if self.is_generation and sampling_params.think_end_str:
+            # Prompts that already end at </think> should start directly in
+            # post-thinking mode instead of waiting to regenerate the boundary.
+            think_end_ids = self.tokenizer.encode(
+                sampling_params.think_end_str, add_special_tokens=False
+            )
+            if (
+                think_end_ids
+                and len(input_ids) >= len(think_end_ids)
+                and input_ids[-len(think_end_ids) :] == think_end_ids
+            ):
+                sampling_params.start_after_thinking = True
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

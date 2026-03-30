@@ -478,6 +478,9 @@ class Req:
             }
         self.sampling_params = sampling_params
         self.sampling_params.think_end_str_id = None
+        self.starts_after_thinking = bool(
+            getattr(self.sampling_params, "start_after_thinking", False)
+        )
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
@@ -641,6 +644,7 @@ class Req:
 
             # Replay requests should directly run normal decoding after replay prefill.
             if self.soft_thinking_replay_len > 0:
+                self.starts_after_thinking = True
                 self.sampling_params.soft_thinking_mode = torch.tensor(
                     False, dtype=torch.bool, device="cuda"
                 )
@@ -906,6 +910,8 @@ class Req:
 
     def get_think_and_full_len(self) -> Tuple[int, int]:
         full_len = len(self.output_ids)
+        if self.starts_after_thinking:
+            return 0, full_len
         think_len = full_len
 
         think_end_id = self.sampling_params.think_end_str_id

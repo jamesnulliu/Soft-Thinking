@@ -121,6 +121,7 @@ def _assert_len_metadata(
     topk_indices: List[List[int]],
     think_end_id: int,
     label: str,
+    starts_after_think: bool = False,
 ) -> Tuple[int, int, str]:
     if "think_len" not in meta_info:
         raise AssertionError(f"[{label}] Missing `think_len` in meta_info.")
@@ -144,7 +145,10 @@ def _assert_len_metadata(
         (i for i, row in enumerate(topk_indices) if row and int(row[0]) == think_end_id),
         None,
     )
-    expected_think_len = resp_len if think_end_step is None else think_end_step
+    if starts_after_think and think_end_step is None:
+        expected_think_len = 0
+    else:
+        expected_think_len = resp_len if think_end_step is None else think_end_step
     if think_len != expected_think_len:
         raise AssertionError(
             f"[{label}] think_len mismatch. expected={expected_think_len}, got={think_len}"
@@ -264,6 +268,7 @@ def run_replay_happy_path(
         replay_topk_indices,
         think_end_id,
         f"{mode_label}/replay",
+        starts_after_think=True,
     )
 
     baseline_first2 = [

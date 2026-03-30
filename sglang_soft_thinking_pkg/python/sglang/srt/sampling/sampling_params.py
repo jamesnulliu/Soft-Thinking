@@ -65,6 +65,7 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
+        start_after_thinking: bool = False,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -108,6 +109,7 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
+        self.start_after_thinking = start_after_thinking
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -208,4 +210,6 @@ class SamplingParams:
 
     def post_init_soft_thinking_mode(self):
         # TODO: 换成cpu的，然后init的时候再传输，topk也是一样，会造成主卡显存不足
-        self.soft_thinking_mode = torch.tensor(True, dtype=torch.bool, device='cuda') 
+        self.soft_thinking_mode = torch.tensor(
+            not self.start_after_thinking, dtype=torch.bool, device="cuda"
+        )
