@@ -116,18 +116,15 @@ class Sampler(nn.Module):
             if crash_on_warnings():
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
-        # We only keep track of the original probs for entropy calculation
-        _probs = self.agg_probs(logits)
-        entropy = -torch.sum(_probs * torch.log(_probs.clamp(min=1e-12)), dim=-1)
-        logits_output.entropy = entropy
-        del _probs
-
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             # ==========
             # begin of soft thinking
             # ==========
             probs = self.agg_probs(logits)
+            logits_output.entropy = -torch.sum(
+                probs * torch.log(probs.clamp(min=1e-12)), dim=-1
+            )
             if return_logprob:
                 # logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
@@ -156,6 +153,9 @@ class Sampler(nn.Module):
             # probs = logits
             # del logits
             probs = self.agg_probs(logits)
+            logits_output.entropy = -torch.sum(
+                probs * torch.log(probs.clamp(min=1e-12)), dim=-1
+            )
 
             if global_server_args_dict["sampling_backend"] == "flashinfer":
                 if return_logprob:
@@ -171,8 +171,6 @@ class Sampler(nn.Module):
                 # ==========
                 # begin of soft thinking
                 # ==========
-                # calculate the entropy
-                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
                 if enable_soft_thinking:
                     soft_mask = sampling_info.soft_thinking_modes  # Shape (B,)
                     top_ps = torch.where(
