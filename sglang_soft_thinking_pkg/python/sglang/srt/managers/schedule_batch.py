@@ -866,14 +866,10 @@ class Req:
                 self.topk_idx[0] = self.sampling_params.think_end_str_id
                 self.low_entropy_steps = 0
         else:
-            if self.sampling_params.early_stopping_entropy_threshold > 0:
-                if self.entropy < self.sampling_params.early_stopping_entropy_threshold:
-                    self.low_entropy_steps += 1
-                else:
-                    self.low_entropy_steps = 0
-                if self.low_entropy_steps >= self.sampling_params.early_stopping_length_threshold:
-                    print("Early stopping triggered.", flush=True)
-                    self.to_abort = True
+            # Entropy-based early stop is only meant to end the thinking phase.
+            # After </think>, continuation should decode normally without a
+            # second low-entropy abort.
+            self.low_entropy_steps = 0
 
             # 普通模式下只需 in-place 清零 tail，head 保持 logits 输出
             self.topk_prob[1:].fill_(0)
