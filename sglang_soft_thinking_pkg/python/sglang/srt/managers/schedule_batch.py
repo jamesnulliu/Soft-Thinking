@@ -743,28 +743,81 @@ class Req:
             cache_keys.append(("soft_thinking_replay", idx_tuple, prob_bits_tuple))
         return cache_keys
 
+    def _get_recorded_soft_thinking_rows(
+        self,
+    ) -> Tuple[List[List[int]], List[List[float]]]:
+        if not self.enable_soft_thinking:
+            return [], []
+
+        topk_indices = copy.deepcopy(self.output_topk_idx_list)
+        topk_probs = copy.deepcopy(self.output_topk_prob_list)
+
+        if self.output_topk_idx_list_tmp:
+            topk_indices.extend(
+                torch.stack(self.output_topk_idx_list_tmp, dim=0).cpu().tolist()
+            )
+        if self.output_topk_prob_list_tmp:
+            topk_probs.extend(
+                torch.stack(self.output_topk_prob_list_tmp, dim=0).cpu().tolist()
+            )
+
+        return topk_indices, topk_probs
+
+    def _build_soft_thinking_output_cache_keys(self) -> List[ReplayCacheKey]:
+        topk_indices, topk_probs = self._get_recorded_soft_thinking_rows()
+        think_len, _ = self.get_think_and_full_len()
+        if think_len <= 0 or not topk_indices or not topk_probs:
+            return []
+
+        topk_indices = topk_indices[:think_len]
+        topk_probs = topk_probs[:think_len]
+        if not topk_indices or not topk_probs:
+            return []
+
+        replay_probs_bf16_f32 = (
+            torch.tensor(topk_probs, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .to(torch.float32)
+            .tolist()
+        )
+
+        cache_keys: List[ReplayCacheKey] = []
+        for idx_row, prob_row in zip(topk_indices, replay_probs_bf16_f32):
+            idx_tuple = tuple(int(x) for x in idx_row)
+            prob_bits_tuple = tuple(
+                self._float32_to_bfloat16_bits(float(p)) for p in prob_row
+            )
+            cache_keys.append(("soft_thinking_replay", idx_tuple, prob_bits_tuple))
+        return cache_keys
+
     def get_prefix_cache_keys(
         self, token_ids: List[int], start_pos: int = 0
     ) -> List[PrefixCacheKey]:
-        if (
-            self.soft_thinking_replay_len == 0
-            or len(token_ids) == 0
-            or not self.enable_think_prefix_cache
-        ):
+        if len(token_ids) == 0 or not self.enable_think_prefix_cache:
             return list(token_ids)
 
         keys: List[PrefixCacheKey] = list(token_ids)
-        replay_start = self.soft_thinking_replay_prompt_len
-        replay_end = replay_start + self.soft_thinking_replay_len
-        end_pos = start_pos + len(token_ids)
 
+        if self.soft_thinking_replay_len > 0:
+            replay_start = self.soft_thinking_replay_prompt_len
+            replay_cache_keys = self.soft_thinking_replay_cache_keys
+        else:
+            replay_start = len(self.origin_input_ids)
+            replay_cache_keys = self._build_soft_thinking_output_cache_keys()
+
+        replay_len = len(replay_cache_keys)
+        if replay_len == 0:
+            return keys
+
+        replay_end = replay_start + replay_len
+        end_pos = start_pos + len(token_ids)
         overlap_start = max(start_pos, replay_start)
         overlap_end = min(end_pos, replay_end)
         if overlap_start < overlap_end:
             src_start = overlap_start - replay_start
             dst_start = overlap_start - start_pos
             span_len = overlap_end - overlap_start
-            keys[dst_start : dst_start + span_len] = self.soft_thinking_replay_cache_keys[
+            keys[dst_start : dst_start + span_len] = replay_cache_keys[
                 src_start : src_start + span_len
             ]
         return keys
