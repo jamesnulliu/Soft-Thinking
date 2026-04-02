@@ -811,6 +811,7 @@ def run_sglang_standard_generation(
     thinking_params = copy.deepcopy(sampling_params)
     thinking_params["max_new_tokens"] = thinking_max_new_tokens
     thinking_params["stop"] = think_end_str
+    thinking_params["no_stop_trim"] = True
     thinking_outputs = ensure_output_list(model.generate(input_prompts, thinking_params))
     if len(thinking_outputs) != len(input_units):
         raise AssertionError(
@@ -829,10 +830,8 @@ def run_sglang_standard_generation(
         )
         output_text = extract_sglang_text(output, tokenizer)
         entropies = extract_output_entropies(output)
-        if did_stop_on_stop_str(meta_info, think_end_str):
-            prefill_text = output_text
-        else:
-            prefill_text = close_thinking_trace(output_text, think_end_str)
+        prefill_text = close_thinking_trace(output_text, think_end_str)
+        if not did_stop_on_stop_str(meta_info, think_end_str):
             logger.warning(
                 "Standard warmup sample_idx=%s did not finish thinking in %s tokens. finish_reason=%r. "
                 + "Force-closing with %r and continuing with response budget=%s.",
@@ -953,6 +952,7 @@ def run_sglang_replay_generation(
         warmup_params = copy.deepcopy(sampling_params)
         warmup_params["max_new_tokens"] = warmup_max_new_tokens
         warmup_params["stop"] = think_end_str
+        warmup_params["no_stop_trim"] = True
         warmup_outputs = ensure_output_list(
             model.generate(
                 prompt=[item["prompt"] for item in chunk_infos],
@@ -1003,6 +1003,9 @@ def run_sglang_replay_generation(
                     )
                 continue
 
+            closed_warmup_text = close_thinking_trace(
+                warmup_text, think_end_str
+            )
             warmup_info = extract_replay_trace_from_warmup_output(
                 output=warmup_output,
                 sampling_params=sampling_params,
@@ -1012,6 +1015,7 @@ def run_sglang_replay_generation(
                     {
                         "sample_idx": int(sample_info["sample_idx"]),
                         "prompt_ids": sample_info["prompt_ids"],
+                        "prefill_text": closed_warmup_text,
                         "replay_trace": warmup_info["replay_trace"],
                         "warmup_full_len": int(warmup_info["full_len"]),
                         "warmup_think_len": int(warmup_info["think_len"]),
@@ -1077,7 +1081,10 @@ def run_sglang_replay_generation(
                     allow_all_thinking=hit_token_budget,
                 )
                 sample_idx = int(replay_unit["sample_idx"])
-                grouped_outputs[sample_idx].append(extract_sglang_text(output, tokenizer))
+                grouped_outputs[sample_idx].append(
+                    str(replay_unit["prefill_text"])
+                    + extract_sglang_text(output, tokenizer)
+                )
                 grouped_generated_tokens[sample_idx].append(
                     int(replay_unit["warmup_full_len"]) + full_len
                 )
