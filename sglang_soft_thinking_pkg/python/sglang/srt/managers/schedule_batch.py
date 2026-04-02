@@ -889,6 +889,7 @@ class Req:
         self.topk_idx = logits_output.topk_indices[index]
         self.entropy = logits_output.entropy[index]
         # last_token_id = self.output_ids[-1]
+        record_terminal_think_step = False
 
         if self.sampling_params.soft_thinking_mode:
             if self.sampling_params.think_end_str_id is None:
@@ -918,6 +919,9 @@ class Req:
                 self.topk_prob[0] = 1.0
                 self.topk_idx[0] = self.sampling_params.think_end_str_id
                 self.low_entropy_steps = 0
+                record_terminal_think_step = True
+                if not self.finished():
+                    self.check_finished()
         else:
             # Entropy-based early stop is only meant to end the thinking phase.
             # After </think>, continuation should decode normally without a
@@ -930,7 +934,7 @@ class Req:
             self.topk_prob[0] = 1.0
 
         # 仅在未完成时记录 topk 信息
-        if not self.finished():
+        if not self.finished() or record_terminal_think_step:
             self.output_topk_prob_list_tmp.append(self.topk_prob)
             self.output_topk_idx_list_tmp.append(self.topk_idx)
 

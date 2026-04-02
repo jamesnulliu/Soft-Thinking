@@ -305,9 +305,18 @@ def _extract_warmup_result(
             f"preview={text_preview!r}"
         )
 
+    if topk_len == think_len:
+        replay_topk_indices = copy.deepcopy(topk_indices)
+        replay_topk_probs = copy.deepcopy(topk_probs)
+        replay_topk_indices.append([int(think_end_ids[-1])])
+        replay_topk_probs.append([1.0])
+    else:
+        replay_topk_indices = copy.deepcopy(topk_indices[:full_len])
+        replay_topk_probs = copy.deepcopy(topk_probs[:full_len])
+
     replay_trace = {
-        "topk_indices": copy.deepcopy(topk_indices[:think_end_step]),
-        "topk_probs": copy.deepcopy(topk_probs[:think_end_step]),
+        "topk_indices": replay_topk_indices,
+        "topk_probs": replay_topk_probs,
     }
 
     warmup_decoded_text = _extract_text(warmup_out, tokenizer)

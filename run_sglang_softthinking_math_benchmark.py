@@ -543,6 +543,7 @@ def close_thinking_trace(thinking_text: str, think_end_str: str) -> str:
 def extract_replay_trace_from_warmup_output(
     output: dict[str, Any],
     sampling_params: dict[str, Any],
+    tokenizer: Any,
 ) -> dict[str, Any]:
     meta_info = output.get("meta_info")
     if not isinstance(meta_info, dict):
@@ -575,10 +576,32 @@ def extract_replay_trace_from_warmup_output(
             + f"finish_reason={meta_info.get('finish_reason')}"
         )
 
+    think_end_ids = tokenizer.encode(think_end_str, add_special_tokens=False)
+    if not think_end_ids:
+        raise AssertionError(
+            f"Tokenizer could not encode think_end_str={think_end_str!r}."
+        )
+    think_end_id = int(think_end_ids[-1])
+
+    trace_len = len(topk_indices)
+    if trace_len == think_len:
+        replay_topk_indices = copy.deepcopy(topk_indices)
+        replay_topk_probs = copy.deepcopy(topk_probs)
+        replay_topk_indices.append([think_end_id])
+        replay_topk_probs.append([1.0])
+    elif trace_len == full_len:
+        replay_topk_indices = copy.deepcopy(topk_indices)
+        replay_topk_probs = copy.deepcopy(topk_probs)
+    else:
+        raise AssertionError(
+            "Warmup trace length must match think_len or full_len: "
+            + f"trace_len={trace_len}, think_len={think_len}, full_len={full_len}"
+        )
+
     return {
         "replay_trace": {
-            "topk_indices": copy.deepcopy(topk_indices[:think_len]),
-            "topk_probs": copy.deepcopy(topk_probs[:think_len]),
+            "topk_indices": replay_topk_indices,
+            "topk_probs": replay_topk_probs,
         },
         "full_len": full_len,
         "think_len": think_len,
@@ -1009,6 +1032,7 @@ def run_sglang_replay_generation(
             warmup_info = extract_replay_trace_from_warmup_output(
                 output=warmup_output,
                 sampling_params=sampling_params,
+                tokenizer=tokenizer,
             )
             for _ in range(n_sampling):
                 replay_units.append(
