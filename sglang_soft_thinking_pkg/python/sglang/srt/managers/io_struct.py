@@ -646,8 +646,9 @@ class BatchTokenIDOut:
     # Soft thinking
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
-    # ↓ (n_request, output_len)
-    output_entropies_list: List[List[float]]
+    # ↓ (n_request, output_len); each decode step is either a scalar entropy
+    # or the list of per-layer entropies when LAYER_ENTROPIES=1.
+    output_entropies_list: List[List[Union[float, List[float]]]]
     # ==========
     # end of soft thinking
     # ==========
@@ -706,8 +707,9 @@ class BatchStrOut:
     # ==========
     output_topk_probs_list: List[List[List[float]]]
     output_topk_indices_list: List[List[List[int]]]
-    # ↓ (n_request, output_len)
-    output_entropies_list: List[List[float]]
+    # ↓ (n_request, output_len); each decode step is either a scalar entropy
+    # or the list of per-layer entropies when LAYER_ENTROPIES=1.
+    output_entropies_list: List[List[Union[float, List[float]]]]
     # ==========
     # end of soft thinking
     # ==========

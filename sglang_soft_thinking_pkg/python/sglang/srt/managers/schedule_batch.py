@@ -88,6 +88,13 @@ global_server_args_dict = {
 
 logger = logging.getLogger(__name__)
 
+
+def _entropy_to_python_value(entropy: torch.Tensor) -> Union[float, List[float]]:
+    """Convert an entropy tensor to a response-friendly Python value."""
+    if entropy.ndim == 0:
+        return entropy.item()
+    return entropy.detach().cpu().tolist()
+
 ReplayCacheKey = Tuple[str, Tuple[int, ...], Tuple[int, ...]]
 PrefixCacheKey = Union[int, ReplayCacheKey]
 
@@ -941,7 +948,13 @@ class Req:
     def update_entropy_info(self, logits_output, index):
         self.entropy = logits_output.entropy[index]
         if not self.finished():
-            self.output_entropies_list_tmp.append(self.entropy.item())
+            layer_entropies = getattr(logits_output, "layer_entropies", None)
+            entropy_value = (
+                _entropy_to_python_value(layer_entropies[index])
+                if layer_entropies is not None
+                else self.entropy.item()
+            )
+            self.output_entropies_list_tmp.append(entropy_value)
 
     def get_output_topk_prob_list(self):
         if self.output_topk_prob_list_tmp:

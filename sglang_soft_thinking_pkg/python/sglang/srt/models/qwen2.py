@@ -46,9 +46,23 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 
 Qwen2Config = None
+
+
+def _parse_layer_weights() -> list[float]:
+    """Parse layer weights used for Qwen layer aggregation."""
+    raw_layer_weights = os.getenv("LAYER_WEIGHTS", "1.0")
+    layer_weights = [float(w.strip()) for w in raw_layer_weights.split(",") if w.strip()]
+    return layer_weights or [1.0]
+
+
+def _get_qwen_layers_to_keep(num_hidden_layers: int) -> int:
+    """Return how many Qwen decoder layers should materialize logits."""
+    if get_bool_env_var("LAYER_ENTROPIES"):
+        return num_hidden_layers
+    return min(num_hidden_layers, len(_parse_layer_weights()))
 
 
 class Qwen2MLP(nn.Module):
@@ -274,11 +288,7 @@ class Qwen2Model(nn.Module):
         # end of soft thinking
         # ==========
 
-        raw_layer_weights = os.getenv("LAYER_WEIGHTS", "1.0")
-        layer_weights = [float(w.strip()) for w in raw_layer_weights.split(",") if w.strip()]
-        if not layer_weights:
-            layer_weights = [1.0]
-        self.n_layers_to_keep = len(layer_weights)  # Keep track the last n layers
+        self.n_layers_to_keep = _get_qwen_layers_to_keep(config.num_hidden_layers)
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):

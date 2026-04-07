@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List
 
 import torch
@@ -27,6 +28,41 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 
 
+def _parse_layer_weights() -> list[float]:
+    """Parse layer weights used for multi-layer Qwen sampling."""
+    raw_weights = os.getenv("LAYER_WEIGHTS", "1.0")
+    weights = [float(weight.strip()) for weight in raw_weights.split(",") if weight.strip()]
+    return weights or [1.0]
+
+
+def _compute_entropy_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Compute entropy from a batch of probability distributions."""
+    return -torch.sum(probs * torch.log(probs.clamp(min=1e-12)), dim=-1)
+
+
+def _compute_layer_entropies(
+    logits: torch.Tensor | list[torch.Tensor],
+) -> torch.Tensor | None:
+    """Compute per-layer entropies for a batch of logits."""
+    if not isinstance(logits, list):
+        return None
+
+    stacked_logits = torch.stack(logits)
+    probs = torch.softmax(stacked_logits, dim=-1)
+    return _compute_entropy_from_probs(probs).transpose(0, 1).contiguous()
+
+
+def _select_logits_for_aggregation(
+    logits: torch.Tensor | list[torch.Tensor], weights_tensor: torch.Tensor
+) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor]:
+    """Select the layer logits that participate in weighted aggregation."""
+    if not isinstance(logits, list):
+        return logits, weights_tensor
+
+    num_weighted_layers = min(len(logits), int(weights_tensor.numel()))
+    return logits[-num_weighted_layers:], weights_tensor[-num_weighted_layers:]
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -35,13 +71,12 @@ class Sampler(nn.Module):
 
         if global_server_args_dict["enable_dp_attention"]:
             self.tp_sync_group = get_attention_tp_group().device_group
-        
-        import os
+
         # Load config ONCE, not during the forward pass
         self.agg_method = os.getenv("AGG_METHOD", "logit-level")
-        raw_weights = os.getenv("LAYER_WEIGHTS", "1.0")
-        self.weights_list = [float(w) for w in raw_weights.split(",")]
-        
+        self.weights_list = _parse_layer_weights()
+        self.layer_entropies_enabled = get_bool_env_var("LAYER_ENTROPIES")
+
         # Convert to tensor for faster vector operations later
         self.weights_tensor = torch.tensor(self.weights_list)
 
@@ -50,11 +85,12 @@ class Sampler(nn.Module):
         if not isinstance(logits, list):
             return torch.softmax(logits, dim=-1)
 
+        logits, weights = _select_logits_for_aggregation(logits, self.weights_tensor)
         # Move weights to the same device/dtype as the data
-        weights = self.weights_tensor.to(device=logits[0].device, dtype=logits[0].dtype)
-        
+        weights = weights.to(device=logits[0].device, dtype=logits[0].dtype)
+
         # Stack logits into a single tensor: Shape [num_layers, batch, classes]
-        stacked_logits = torch.stack(logits) 
+        stacked_logits = torch.stack(logits)
         # Reshape weights for broadcasting: [num_layers, 1, 1]
         w = weights.view(-1, 1, 1)
 
@@ -122,9 +158,9 @@ class Sampler(nn.Module):
             # begin of soft thinking
             # ==========
             probs = self.agg_probs(logits)
-            logits_output.entropy = -torch.sum(
-                probs * torch.log(probs.clamp(min=1e-12)), dim=-1
-            )
+            logits_output.entropy = _compute_entropy_from_probs(probs)
+            if self.layer_entropies_enabled:
+                logits_output.layer_entropies = _compute_layer_entropies(logits)
             if return_logprob:
                 # logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
@@ -153,9 +189,9 @@ class Sampler(nn.Module):
             # probs = logits
             # del logits
             probs = self.agg_probs(logits)
-            logits_output.entropy = -torch.sum(
-                probs * torch.log(probs.clamp(min=1e-12)), dim=-1
-            )
+            logits_output.entropy = _compute_entropy_from_probs(probs)
+            if self.layer_entropies_enabled:
+                logits_output.layer_entropies = _compute_layer_entropies(logits)
 
             if global_server_args_dict["sampling_backend"] == "flashinfer":
                 if return_logprob:
